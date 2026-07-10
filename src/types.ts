@@ -138,6 +138,8 @@ export interface Capabilities {
 
 export interface AuditReport {
   site: string;
+  /** Display label from the site config, if any. */
+  label?: string;
   baseUrl: string;
   stamp: string;
   startedAt: string;

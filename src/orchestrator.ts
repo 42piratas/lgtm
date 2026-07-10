@@ -125,6 +125,7 @@ export async function runAudit(opts: OrchestratorOptions): Promise<AuditReport> 
 
   return {
     site: opts.site.name,
+    label: opts.site.label,
     baseUrl: opts.baseUrl,
     stamp: opts.stamp,
     startedAt,
