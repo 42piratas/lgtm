@@ -10,7 +10,8 @@
   "scripts": {
     "audit": "tsx src/cli.ts",
     "setup": "playwright install chromium",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "engines": {
     "node": ">=20"
@@ -29,6 +30,7 @@
   "devDependencies": {
     "@types/node": "^22.9.0",
     "tsx": "^4.19.2",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "vitest": "^3.2.7"
   }
 }
