@@ -156,6 +156,37 @@ describe("a11yRunner — de-dup and tallying across pages", () => {
     expect(contrastFindings).toHaveLength(1);
   });
 
+  it("keeps the SAME rule on DISTINCT targets as separate findings — the de-dup key is rule+target, not rule alone", async () => {
+    // Guards the de-dup key itself. If the key collapses from
+    // `${v.id}::${target}` to just `${v.id}`, two genuinely different failing
+    // elements silently merge into one finding and an operator fixes one and
+    // thinks they're done. Same rule, two different targets, one page.
+    nextViolations = [
+      [
+        violation("color-contrast", "serious", "#header-cta"),
+        violation("color-contrast", "serious", "#footer-link"),
+      ],
+    ];
+    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    const contrastFindings = result.findings.filter((f) => f.id === "a11y-color-contrast");
+    expect(contrastFindings).toHaveLength(2);
+    expect(contrastFindings.map((f) => f.location).sort()).toEqual([
+      "https://example.com #footer-link",
+      "https://example.com #header-cta",
+    ]);
+  });
+
+  it("keeps DISTINCT rules on the same target as separate findings", async () => {
+    nextViolations = [
+      [
+        violation("color-contrast", "serious", "#cta"),
+        violation("link-name", "serious", "#cta"),
+      ],
+    ];
+    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    expect(result.findings.filter((f) => f.id.startsWith("a11y-"))).toHaveLength(2);
+  });
+
   it("tallies contrastNodes across every color-contrast violation, including de-duped repeats", async () => {
     nextViolations = [
       [violation("color-contrast", "serious", "#shared", 3)],

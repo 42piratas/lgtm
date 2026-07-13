@@ -120,13 +120,31 @@ describe("headersRunner — HSTS", () => {
     expect(hsts.title).toMatch(/no Strict-Transport-Security/);
   });
 
-  it("flags a weak max-age below one year", async () => {
+  it("flags a max-age one second below the one-year threshold, and accepts one exactly at it", async () => {
+    // The boundary itself, not a value 350x away from it: max-age=3600 would
+    // still "pass" a threshold weakened to a single day. 31536000 is one year;
+    // the check is `< 31536000`, so 31535999 must fail and 31536000 must not.
     vi.mocked(fetchUrl).mockResolvedValue(
-      response({ headers: { ...STRONG_HEADERS, "strict-transport-security": "max-age=3600" } }),
+      response({ headers: { ...STRONG_HEADERS, "strict-transport-security": "max-age=31535999" } }),
+    );
+    const justUnder = await headersRunner.run(ctx("https://example.com"));
+    expect(justUnder.findings.find((f) => f.id === "hsts")!.title).toMatch(
+      /max-age 31535999 < 1 year/,
+    );
+
+    vi.mocked(fetchUrl).mockResolvedValue(
+      response({ headers: { ...STRONG_HEADERS, "strict-transport-security": "max-age=31536000" } }),
+    );
+    const exactlyAt = await headersRunner.run(ctx("https://example.com"));
+    expect(exactlyAt.findings.find((f) => f.id === "hsts")).toBeUndefined();
+  });
+
+  it("flags an HSTS header with no max-age directive at all", async () => {
+    vi.mocked(fetchUrl).mockResolvedValue(
+      response({ headers: { ...STRONG_HEADERS, "strict-transport-security": "includeSubDomains" } }),
     );
     const result = await headersRunner.run(ctx("https://example.com"));
-    const hsts = result.findings.find((f) => f.id === "hsts")!;
-    expect(hsts.title).toMatch(/max-age 3600 < 1 year/);
+    expect(result.findings.find((f) => f.id === "hsts")!.title).toMatch(/no max-age directive/);
   });
 
   it("does not require HSTS over plain http (it is meaningless there)", async () => {
@@ -156,15 +174,141 @@ describe("headersRunner — X-Frame-Options / frame-ancestors", () => {
   });
 });
 
-describe("headersRunner — information leakage", () => {
-  it("flags a Server header that leaks stack detail", async () => {
+// The four checks below are the ones most likely to be quietly neutered: they
+// are simple presence/value checks, so an `evaluate` accidentally reduced to
+// `() => null` disables them forever without anything else breaking. Each is
+// pinned on BOTH the missing case and the declared severity, so silently
+// disabling the check — or downgrading it — fails the suite.
+describe("headersRunner — x-content-type-options", () => {
+  it("flags a missing header at medium severity", async () => {
+    const headers = { ...STRONG_HEADERS };
+    delete (headers as Record<string, string>)["x-content-type-options"];
+    vi.mocked(fetchUrl).mockResolvedValue(response({ headers }));
+    const result = await headersRunner.run(ctx("https://example.com"));
+    const f = result.findings.find((x) => x.id === "x-content-type-options")!;
+    expect(f).toBeDefined();
+    expect(f.severity).toBe("medium");
+    expect(f.title).toMatch(/missing or not 'nosniff'/);
+  });
+
+  it("flags a present-but-wrong value (anything that isn't nosniff)", async () => {
     vi.mocked(fetchUrl).mockResolvedValue(
-      response({ headers: { ...STRONG_HEADERS, server: "nginx/1.18.0 (Ubuntu)" } }),
+      response({ headers: { ...STRONG_HEADERS, "x-content-type-options": "sniff" } }),
     );
     const result = await headersRunner.run(ctx("https://example.com"));
-    const leak = result.findings.find((f) => f.id === "leak-server")!;
+    const f = result.findings.find((x) => x.id === "x-content-type-options")!;
+    expect(f).toBeDefined();
+    expect(f.severity).toBe("medium");
+  });
+
+  it("accepts nosniff", async () => {
+    vi.mocked(fetchUrl).mockResolvedValue(
+      response({ headers: { ...STRONG_HEADERS, "x-content-type-options": "nosniff" } }),
+    );
+    const result = await headersRunner.run(ctx("https://example.com"));
+    expect(result.findings.find((x) => x.id === "x-content-type-options")).toBeUndefined();
+  });
+});
+
+describe("headersRunner — referrer-policy", () => {
+  it("flags a missing header at low severity", async () => {
+    const headers = { ...STRONG_HEADERS };
+    delete (headers as Record<string, string>)["referrer-policy"];
+    vi.mocked(fetchUrl).mockResolvedValue(response({ headers }));
+    const result = await headersRunner.run(ctx("https://example.com"));
+    const f = result.findings.find((x) => x.id === "referrer-policy")!;
+    expect(f).toBeDefined();
+    expect(f.severity).toBe("low");
+    expect(f.title).toMatch(/no Referrer-Policy header/);
+  });
+
+  it("accepts any present value", async () => {
+    vi.mocked(fetchUrl).mockResolvedValue(
+      response({ headers: { ...STRONG_HEADERS, "referrer-policy": "no-referrer" } }),
+    );
+    const result = await headersRunner.run(ctx("https://example.com"));
+    expect(result.findings.find((x) => x.id === "referrer-policy")).toBeUndefined();
+  });
+});
+
+describe("headersRunner — permissions-policy", () => {
+  it("flags a missing header at low severity", async () => {
+    const headers = { ...STRONG_HEADERS };
+    delete (headers as Record<string, string>)["permissions-policy"];
+    vi.mocked(fetchUrl).mockResolvedValue(response({ headers }));
+    const result = await headersRunner.run(ctx("https://example.com"));
+    const f = result.findings.find((x) => x.id === "permissions-policy")!;
+    expect(f).toBeDefined();
+    expect(f.severity).toBe("low");
+    expect(f.title).toMatch(/no Permissions-Policy header/);
+  });
+
+  it("accepts any present value", async () => {
+    vi.mocked(fetchUrl).mockResolvedValue(
+      response({ headers: { ...STRONG_HEADERS, "permissions-policy": "camera=()" } }),
+    );
+    const result = await headersRunner.run(ctx("https://example.com"));
+    expect(result.findings.find((x) => x.id === "permissions-policy")).toBeUndefined();
+  });
+});
+
+describe("headersRunner — cross-origin-opener-policy", () => {
+  it("flags a missing header at low severity", async () => {
+    const headers = { ...STRONG_HEADERS };
+    delete (headers as Record<string, string>)["cross-origin-opener-policy"];
+    vi.mocked(fetchUrl).mockResolvedValue(response({ headers }));
+    const result = await headersRunner.run(ctx("https://example.com"));
+    const f = result.findings.find((x) => x.id === "coop")!;
+    expect(f).toBeDefined();
+    expect(f.severity).toBe("low");
+    expect(f.title).toMatch(/missing\/weak COOP/);
+  });
+
+  it("flags a present-but-weak value (unsafe-none)", async () => {
+    vi.mocked(fetchUrl).mockResolvedValue(
+      response({ headers: { ...STRONG_HEADERS, "cross-origin-opener-policy": "unsafe-none" } }),
+    );
+    const result = await headersRunner.run(ctx("https://example.com"));
+    const f = result.findings.find((x) => x.id === "coop")!;
+    expect(f).toBeDefined();
+    expect(f.severity).toBe("low");
+  });
+
+  it("accepts same-origin", async () => {
+    vi.mocked(fetchUrl).mockResolvedValue(
+      response({ headers: { ...STRONG_HEADERS, "cross-origin-opener-policy": "same-origin" } }),
+    );
+    const result = await headersRunner.run(ctx("https://example.com"));
+    expect(result.findings.find((x) => x.id === "coop")).toBeUndefined();
+  });
+});
+
+describe("headersRunner — information leakage", () => {
+  // Every entry in LEAKY, not just the first: dropping any one of them from
+  // the list must fail the suite.
+  it.each([
+    ["server", "nginx/1.18.0 (Ubuntu)"],
+    ["x-powered-by", "Express"],
+    ["x-aspnet-version", "4.0.30319"],
+  ])("flags the %s header as a low-severity stack leak", async (header, value) => {
+    vi.mocked(fetchUrl).mockResolvedValue(
+      response({ headers: { ...STRONG_HEADERS, [header]: value } }),
+    );
+    const result = await headersRunner.run(ctx("https://example.com"));
+    const leak = result.findings.find((f) => f.id === `leak-${header}`)!;
+    expect(leak).toBeDefined();
     expect(leak.severity).toBe("low");
-    expect(leak.evidence).toContain("nginx/1.18.0");
+    expect(leak.evidence).toContain(value);
+  });
+
+  it("flags every leaky header present, not just the first one found", async () => {
+    vi.mocked(fetchUrl).mockResolvedValue(
+      response({
+        headers: { ...STRONG_HEADERS, server: "nginx", "x-powered-by": "Express" },
+      }),
+    );
+    const result = await headersRunner.run(ctx("https://example.com"));
+    expect(result.findings.filter((f) => f.id.startsWith("leak-"))).toHaveLength(2);
   });
 });
 
