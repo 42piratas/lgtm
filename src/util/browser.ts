@@ -24,6 +24,18 @@ export class BrowserSession {
       storageState,
       ignoreHTTPSErrors: true,
       userAgent: "lgtm/0.1 (+security-harness)",
+      // Ask for reduced motion. Two reasons, and both are load-bearing:
+      //
+      // 1. Correctness. Well-built entrance animations skip their hidden start
+      //    state entirely under `prefers-reduced-motion` (42labs.io's own
+      //    RevealOnScroll does exactly this). Without it, the scan races the
+      //    animation: content is still `opacity: 0`, axe treats it as not
+      //    rendered, and the page comes back "clean" having audited nothing.
+      //    With it, the same page deterministically exposes its real content.
+      //
+      // 2. It is the honest thing to audit. A reduced-motion user is a real
+      //    user, and it is the render path least likely to have been looked at.
+      reducedMotion: "reduce",
     });
     return this.ctx;
   }
