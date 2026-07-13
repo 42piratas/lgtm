@@ -41,6 +41,42 @@ async function settleTransitions(page: import("playwright").Page): Promise<void>
     .catch(() => {});
 }
 
+// Reveal-on-scroll is a false-NEGATIVE machine, and those are worse than false
+// positives: a page that hides its content until it scrolls into view is scanned
+// while that content is still `opacity: 0`, axe treats it as not rendered, and
+// the run comes back "clean". It looks like a pass. It is an audit of nothing.
+//
+// Measured on 42labs.io's homepage (cards gated by an IntersectionObserver):
+//   without scrolling → 0 violations
+//   with scrolling    → 1 violation, 3 contrast nodes
+//
+// Note this is specifically about *reveal gating*, not about axe ignoring
+// off-screen elements — axe finds off-viewport nodes fine (verified: tron.42labs.io
+// and 42piratas.com/datasheet/ report identical findings scrolled or not). What it
+// cannot see is content the page itself is still hiding.
+//
+// So: walk the whole page to trigger every observer, return to the top, and let
+// the reveal animations settle before analysing.
+async function revealLazyContent(page: import("playwright").Page): Promise<void> {
+  await page
+    .evaluate(async () => {
+      const step = Math.max(200, window.innerHeight * 0.8);
+      const height = () =>
+        Math.max(
+          document.body.scrollHeight,
+          document.documentElement.scrollHeight,
+        );
+      // Guard against pages that grow as you scroll (infinite feeds).
+      for (let y = 0, guard = 0; y < height() && guard < 60; y += step, guard++) {
+        window.scrollTo(0, y);
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      window.scrollTo(0, 0);
+      await new Promise((r) => setTimeout(r, 150));
+    })
+    .catch(() => {});
+}
+
 export const a11yRunner: Runner = {
   id: "a11y",
   domain: "a11y",
@@ -68,6 +104,13 @@ export const a11yRunner: Runner = {
           await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
           // Let late-mounted client UI settle without hanging on long-poll/analytics.
           await page.waitForLoadState("load", { timeout: 10_000 }).catch(() => {});
+          // Scrolling before hydration is a no-op: the IntersectionObservers that
+          // gate reveal-on-scroll content aren't attached yet, so nothing reveals
+          // and the scan still sees an empty page. Let the client mount first.
+          await page
+            .waitForLoadState("networkidle", { timeout: 5_000 })
+            .catch(() => {});
+          await revealLazyContent(page);
           await settleTransitions(page);
           const results = await new AxeBuilder({ page })
             .withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"])
