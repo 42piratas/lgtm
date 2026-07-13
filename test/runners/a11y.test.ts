@@ -32,6 +32,7 @@ const NO_STROKE_STYLE = {
   fontWeight: "400",
   bgColors: ["rgb(255, 255, 255)"],
   bgImages: ["none"],
+  opacities: ["1"],
 };
 let nextStrokeStyle: Record<string, unknown> = NO_STROKE_STYLE;
 
@@ -276,6 +277,7 @@ describe("a11yRunner — -webkit-text-stroke contrast (bug #5)", () => {
     fontWeight: "600",
     bgColors: ["rgba(0, 0, 0, 0)", "rgb(255, 255, 255)"],
     bgImages: ["none", "none"],
+    opacities: ["1", "1"],
   };
   const strokedAndGenuinelyBad = {
     strokeWidth: "2px",
@@ -284,6 +286,7 @@ describe("a11yRunner — -webkit-text-stroke contrast (bug #5)", () => {
     fontWeight: "400",
     bgColors: ["rgba(0, 0, 0, 0)", "rgb(255, 255, 255)"],
     bgImages: ["none", "none"],
+    opacities: ["1", "1"],
   };
 
   it("downgrades a stroked node whose REAL fill contrast passes to a visible needs-review note, not a hard failure", async () => {

@@ -21,6 +21,7 @@ const base: StrokeStyle = {
   fontWeight: "400",
   bgColors: ["rgba(0, 0, 0, 0)", "rgb(255, 255, 255)"], // transparent node, white body
   bgImages: ["none", "none"],
+  opacities: ["1", "1"], // fully opaque node and ancestors
 };
 
 describe("contrastRatio — the WCAG formula itself", () => {
@@ -127,6 +128,7 @@ describe("classifyStrokeStyle — background resolution", () => {
       ...base,
       bgColors: ["rgba(0, 0, 0, 0)", "rgba(0, 0, 0, 0)", "rgb(255, 255, 255)"],
       bgImages: ["none", "none", "none"],
+      opacities: ["1", "1", "1"],
     };
     expect(classifyStrokeStyle(nested)).toBe("stroke-fill-passes");
   });
@@ -136,6 +138,7 @@ describe("classifyStrokeStyle — background resolution", () => {
       ...base,
       bgColors: ["rgba(0, 0, 0, 0)"],
       bgImages: ["none"],
+      opacities: ["1"],
     };
     expect(classifyStrokeStyle(noBg)).toBe("stroke-fill-passes"); // #4A4A4A on white
   });
@@ -146,7 +149,42 @@ describe("classifyStrokeStyle — background resolution", () => {
       color: "rgb(255, 255, 255)",
       bgColors: ["rgb(20, 20, 20)"],
       bgImages: ["none"],
+      opacities: ["1"],
     };
     expect(classifyStrokeStyle(dark)).toBe("stroke-fill-passes");
+  });
+});
+
+
+// The opacity bypass. Found by an adversarial probe against classifyStrokeStyle
+// after the first narrowing shipped, and it is a REAL false negative of exactly
+// the class this classifier exists to prevent.
+//
+// Element `opacity` is not the same thing as a colour's alpha channel, and it
+// is the sneaky one: `color` can be fully opaque black while an ancestor
+// `opacity: 0.28` renders that text as light grey. Reading only the colour
+// alpha computes 21:1 for text the user actually sees at ~2.3:1 — and would
+// then downgrade a genuine, failing-contrast node to a non-blocking note.
+describe("classifyStrokeStyle — element opacity must not be mistaken for colour alpha", () => {
+  it("KEEPS the hard failure when an ANCESTOR fades the text with opacity", () => {
+    // The exact attack fixture: opaque black text, white page, but a wrapper
+    // div at opacity 0.28. On paper 21:1; on screen ~2.3:1 and unreadable.
+    const faded: StrokeStyle = {
+      ...base,
+      color: "rgb(0, 0, 0)",
+      opacities: ["1", "0.28", "1"],
+      bgColors: ["rgba(0, 0, 0, 0)", "rgba(0, 0, 0, 0)", "rgb(255, 255, 255)"],
+      bgImages: ["none", "none", "none"],
+    };
+    expect(classifyStrokeStyle(faded)).toBe("stroke-fill-fails-or-unknown");
+  });
+
+  it("KEEPS the hard failure when the node ITSELF is faded with opacity", () => {
+    const faded: StrokeStyle = { ...base, opacities: ["0.4", "1"] };
+    expect(classifyStrokeStyle(faded)).toBe("stroke-fill-fails-or-unknown");
+  });
+
+  it("still downgrades a genuinely compliant node when everything is fully opaque", () => {
+    expect(classifyStrokeStyle({ ...base, opacities: ["1", "1"] })).toBe("stroke-fill-passes");
   });
 });

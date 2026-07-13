@@ -112,6 +112,18 @@ export interface StrokeStyle {
   bgColors: string[];
   /** backgroundImage of the node and each ancestor, nearest first. */
   bgImages: string[];
+  /**
+   * Computed `opacity` of the node and each ancestor, nearest first.
+   *
+   * Element opacity is NOT the same thing as a colour's alpha channel, and it
+   * is the sneaky one: `color` can be a fully opaque black while an ancestor
+   * `opacity: 0.28` renders that text as light grey. Reading only the colour
+   * alpha (as the first cut of this did) computes 21:1 for text that the user
+   * actually sees at ~2.3:1 — and would then downgrade a genuine contrast
+   * failure to a non-blocking note. Exactly the false negative this whole
+   * classifier exists to avoid.
+   */
+  opacities: string[];
 }
 
 /** "rgb(1, 2, 3)" / "rgba(1, 2, 3, .5)" → [r,g,b,a], or null if unparseable. */
@@ -154,6 +166,16 @@ export function classifyStrokeStyle(st: StrokeStyle): StrokeVerdict {
 
   const fg = parseRgb(st.color);
   if (!fg || fg[3] < 1) return "stroke-fill-fails-or-unknown"; // translucent text → unsure
+
+  // Any element opacity below 1, on the node or ANY ancestor, fades the text
+  // toward its backdrop by an amount we are not going to try to model. We
+  // cannot then claim the node is compliant, so we don't: keep axe's hard
+  // failure. (Opaque colour + `opacity: 0.28` ancestor renders black text as
+  // light grey — 21:1 on paper, ~2.3:1 in the user's eyes.)
+  for (const o of st.opacities) {
+    const v = parseFloat(o);
+    if (!Number.isNaN(v) && v < 1) return "stroke-fill-fails-or-unknown";
+  }
 
   // Nearest ancestor with a fully opaque background colour. Anything else
   // (image, gradient, translucent stack) is ambiguous → leave axe's call alone.
@@ -200,11 +222,13 @@ async function readStrokeStyle(
       const cs = getComputedStyle(el);
       const bgColors: string[] = [];
       const bgImages: string[] = [];
+      const opacities: string[] = [];
       let node: Element | null = el;
       while (node) {
         const s = getComputedStyle(node);
         bgColors.push(s.backgroundColor);
         bgImages.push(s.backgroundImage);
+        opacities.push(s.opacity);
         node = node.parentElement;
       }
       return {
@@ -214,6 +238,7 @@ async function readStrokeStyle(
         fontWeight: cs.fontWeight,
         bgColors,
         bgImages,
+        opacities,
       };
     })
     .catch(() => null);
