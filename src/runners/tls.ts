@@ -68,18 +68,37 @@ export const tlsRunner: Runner = {
         };
       }
 
-      let parsed: Array<{ id: string; severity: string; finding: string }> = [];
+      // The file existing is not the same guarantee as it containing a real
+      // result: a killed/truncated write leaves a file that exists but
+      // isn't valid JSON. Silently treating that as "parsed to nothing" (as
+      // this code used to) is the same "absence of evidence" bug as every
+      // other runner here — it must error, not report a clean scan.
+      let parsed: Array<{ id: string; severity: string; finding: string }>;
       try {
         const raw = JSON.parse(readFileSync(outPath, "utf8"));
         // Flat --jsonfile is an array; --jsonfile-pretty nests under scanResult.
         parsed = Array.isArray(raw) ? raw : (raw?.scanResult ?? []);
-      } catch {
-        /* leave empty */
+      } catch (err) {
+        return {
+          runnerId: this.id,
+          domain: this.domain,
+          status: "error",
+          note: `testssl.sh wrote unparseable JSON: ${(err as Error).message}`,
+          findings,
+          durationMs: Date.now() - start,
+        };
       }
 
+      // Defense in depth: even with --ip=one, collapse any (id, finding)
+      // pair testssl reports more than once rather than trust a single flag
+      // to be the only thing standing between us and a duplicated report.
+      const seen = new Set<string>();
       for (const item of parsed) {
         const sev = SEVERITY_MAP[item.severity?.toUpperCase?.() ?? ""];
         if (!sev) continue; // OK / INFO
+        const key = `${item.id}::${item.finding}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
         findings.push({
           id: `tls-${item.id}`,
           title: `${item.id}: ${item.finding}`.slice(0, 200),

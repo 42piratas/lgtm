@@ -94,12 +94,34 @@ export const depsRunner: Runner = {
       };
     }
 
-    let out: OsvOutput = {};
+    // A clean osv-scanner JSON run always emits at least `{"results":[]}` —
+    // if stdout has no `{` at all, or what follows it doesn't parse, the
+    // tool didn't produce real output (crash, OOM, truncated write). That is
+    // "unknown", not "zero vulnerabilities": silently falling through to an
+    // empty `out` here is exactly how a dead scanner reports a clean pass.
+    const s = r.stdout.indexOf("{");
+    if (s < 0) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: `osv-scanner produced no parseable output (exit ${r.code}): ${(r.stderr || r.stdout).slice(0, 300)}`,
+        findings,
+        durationMs: Date.now() - start,
+      };
+    }
+    let out: OsvOutput;
     try {
-      const s = r.stdout.indexOf("{");
-      if (s >= 0) out = JSON.parse(r.stdout.slice(s));
-    } catch {
-      /* empty / non-json → treated as clean below */
+      out = JSON.parse(r.stdout.slice(s));
+    } catch (err) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: `osv-scanner produced unparseable JSON: ${(err as Error).message}`,
+        findings,
+        durationMs: Date.now() - start,
+      };
     }
 
     for (const result of out.results ?? []) {

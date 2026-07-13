@@ -88,11 +88,23 @@ export const zapRunner: Runner = {
       };
     }
 
-    let report: ZapReport = {};
+    // The report file existing doesn't mean it's valid: a killed/truncated
+    // write leaves a file present but not parseable JSON. That must error
+    // like every other "tool didn't actually report anything" case here —
+    // not fall through as a silent "no alerts".
+    let report: ZapReport;
     try {
       report = JSON.parse(readFileSync(reportPath, "utf8"));
-    } catch {
-      /* leave empty */
+    } catch (err) {
+      rmSync(workDir, { recursive: true, force: true });
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: `ZAP report was not parseable JSON: ${(err as Error).message}`,
+        findings,
+        durationMs: Date.now() - start,
+      };
     }
     rmSync(workDir, { recursive: true, force: true });
 

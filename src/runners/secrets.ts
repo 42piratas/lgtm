@@ -49,20 +49,35 @@ export const secretsRunner: Runner = {
       timeoutMs: 300_000,
     });
 
-    let leaks: Leak[] = [];
-    try {
-      const s = r.stdout.indexOf("[");
-      if (s >= 0) leaks = JSON.parse(r.stdout.slice(s));
-    } catch {
-      /* non-json → no leaks / error handled below */
-    }
-
-    if (!Array.isArray(leaks) && r.code > 1) {
+    // A clean gitleaks JSON report is still a `[]` on stdout — if there's no
+    // `[` at all, or what follows it isn't a JSON array, the tool didn't
+    // actually report anything (crash, killed, wrong flags). That's
+    // "unknown", not "no secrets": defaulting `leaks` to `[]` in that case
+    // (as this code used to) makes a dead scan indistinguishable from a
+    // clean one, and the `!Array.isArray` check below it never caught that
+    // because the default was already an array.
+    const s = r.stdout.indexOf("[");
+    if (s < 0) {
       return {
         runnerId: this.id,
         domain: this.domain,
         status: "error",
-        note: `gitleaks error: ${r.stderr.slice(0, 300)}`,
+        note: `gitleaks produced no parseable output (exit ${r.code}): ${(r.stderr || r.stdout).slice(0, 300)}`,
+        findings,
+        durationMs: Date.now() - start,
+      };
+    }
+    let leaks: Leak[];
+    try {
+      const parsed = JSON.parse(r.stdout.slice(s));
+      if (!Array.isArray(parsed)) throw new Error("gitleaks report was not a JSON array");
+      leaks = parsed;
+    } catch (err) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: `gitleaks produced unparseable output: ${(err as Error).message}`,
         findings,
         durationMs: Date.now() - start,
       };
