@@ -338,30 +338,42 @@ describe("headersRunner — fetch failure", () => {
 });
 
 describe("headersRunner — regression guards for known field bugs (42L-973)", () => {
-  // Live bug #4: a 429 (rate-limited) response from a WAF/CDN was reported
-  // as "no security headers" — indistinguishable from the real site having
-  // none. headers.ts currently evaluates whatever headers came back
-  // regardless of `res.status`, so this is CURRENTLY BROKEN. Fixing it is a
-  // src/runners/headers.ts behavior change, which is explicitly out of scope
-  // for this PR (owned by the concurrent runner-bugs branch: "429 handling").
-  // Left skipped and documented rather than faked green or fixed here.
-  it.skip("does not report missing-header findings when the response itself is 429/503 (rate-limited/unavailable) — needs the runner-bugs branch's 429 handling", async () => {
+  // These two were written as `it.skip` against a *guessed* post-fix contract
+  // (a finding whose title mentions 429 / the auth gate). The shipped fix uses
+  // a different, better one: the runner REFUSES to score at all — status
+  // "error" with the reason in `note`, and an empty findings list. Emitting a
+  // "finding" would be wrong: a finding is a statement about the site, and the
+  // whole point is that we never saw the site. Re-pointed at the real contract
+  // rather than bent to match the guess.
+
+  // Live bug #2: a 429 from a WAF/CDN (Vercel Bot Protection on 42labs.io) was
+  // reported as "no security headers" — indistinguishable from the real site
+  // having none, on a site that in a browser returns 200 with all 8.
+  it("refuses to score (status error), rather than reporting missing headers, when the response is a 429", async () => {
     vi.mocked(fetchUrl).mockResolvedValue(response({ status: 429, headers: {} }));
     const result = await headersRunner.run(ctx("https://example.com"));
-    // Desired post-fix behavior: an inconclusive/rate-limited signal, not a
-    // wall of "missing header" findings scored against a page that was never
-    // actually served.
-    expect(result.findings.some((f) => /rate.?limit|429/i.test(f.title))).toBe(true);
+
+    expect(result.status).toBe("error");
+    expect(result.note).toMatch(/429/);
+    expect(result.note).toMatch(/unknown, not absent/i);
+    // The critical assertion: NOT a wall of "missing header" findings scored
+    // against a page that was never actually served.
+    expect(result.findings).toHaveLength(0);
     expect(result.findings.find((f) => f.id === "csp")).toBeUndefined();
   });
 
-  // Live bug #3: fetchUrl follows redirects (redirect: "follow") with no
-  // check that the final host still matches the target — a 302 into an
-  // auth gate (e.g. Cloudflare Access) gets scored as if it were the site.
-  // `finalUrl` is recorded in findings' `location`, but nothing flags the
-  // host mismatch. Same story: a src/runners/headers.ts (or util/http.ts)
-  // behavior change, owned by the concurrent branch ("auth-gate detection").
-  it.skip("flags when the final URL redirected to a different host than requested — needs the runner-bugs branch's auth-gate detection", async () => {
+  it("refuses to score a 503 the same way — any non-2xx/3xx is 'unknown', not 'clean'", async () => {
+    vi.mocked(fetchUrl).mockResolvedValue(response({ status: 503, headers: {} }));
+    const result = await headersRunner.run(ctx("https://example.com"));
+    expect(result.status).toBe("error");
+    expect(result.note).toMatch(/503/);
+    expect(result.findings).toHaveLength(0);
+  });
+
+  // Live bug #1: fetchUrl follows redirects with no check that the final host
+  // still matches the target — a 302 into Cloudflare Access got scored as if
+  // it were the site (ds.42labs.io was graded on Cloudflare's login page).
+  it("refuses to score when the response landed on a known auth gate instead of the target", async () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({
         url: "https://app.example.com/dashboard",
@@ -371,6 +383,29 @@ describe("headersRunner — regression guards for known field bugs (42L-973)", (
       }),
     );
     const result = await headersRunner.run(ctx("https://app.example.com/dashboard"));
-    expect(result.findings.some((f) => /redirect|auth.?gate|different host/i.test(f.title))).toBe(true);
+
+    expect(result.status).toBe("error");
+    expect(result.note).toMatch(/auth gate/i);
+    expect(result.note).toMatch(/cloudflareaccess\.com/);
+    expect(result.findings).toHaveLength(0);
+  });
+
+  // The other half of that fix, and the one adversarial review caught: an
+  // apex→www redirect is NOT an auth gate. If this regresses, every project
+  // that redirects to www gets a red build from all five black-box runners —
+  // and a gate that cries wolf gets switched off.
+  it("still scores normally across an apex→www redirect — that is the same site, not a gate", async () => {
+    vi.mocked(fetchUrl).mockResolvedValue(
+      response({
+        url: "https://example.com",
+        finalUrl: "https://www.example.com/",
+        redirected: true,
+        headers: STRONG_HEADERS,
+      }),
+    );
+    const result = await headersRunner.run(ctx("https://example.com"));
+
+    expect(result.status).toBe("ok");
+    expect(result.note).toBeUndefined();
   });
 });

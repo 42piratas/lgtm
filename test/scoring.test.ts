@@ -148,12 +148,36 @@ describe("computePass — the CI gate", () => {
     expect(computePass(results, "high")).toBe(false);
   });
 
-  it("is unaffected by skipped or errored runners with empty findings", () => {
-    const results = [
-      result([], { status: "skipped", note: "no repoPath configured" }),
-      result([], { status: "error", note: "fetch failed" }),
-    ];
+  // NOTE (42L-973): this pair replaces a single earlier test that asserted a
+  // skipped *and* an errored runner both leave the verdict untouched. That
+  // encoded the bug: an errored runner has no findings, but "no findings"
+  // there means UNKNOWN, not clean — osv-scanner erroring out, ZAP failing to
+  // write its report, and headers getting a 429 all produced empty findings
+  // and a green PASS. A skip is a different animal (a capability is absent by
+  // configuration; nothing was attempted and nothing is claimed), so a skip
+  // still must not fail the run. The two cases are now asserted separately
+  // and deliberately.
+  it("passes despite a skipped runner — a skip claims nothing, it is a coverage hole, not a failure", () => {
+    const results = [result([], { status: "skipped", note: "no repoPath configured" })];
     expect(computePass(results, "low")).toBe(true);
+  });
+
+  it("FAILS on an errored runner with no findings — a scan that could not see the site is not a clean bill of health", () => {
+    const results = [result([], { status: "error", note: "HTTP 429 — could not fetch" })];
+    expect(computePass(results, "low")).toBe(false);
+    // ...and at every threshold: an error is not a severity, it's an absence
+    // of evidence. It must never be threshold-dependent.
+    expect(computePass(results, "critical")).toBe(false);
+    expect(computePass(results, "high")).toBe(false);
+  });
+
+  it("FAILS on an errored runner even when every other runner is clean", () => {
+    const results = [
+      result([finding("info")], { runnerId: "headers" }),
+      result([], { runnerId: "cookies" }),
+      result([], { runnerId: "deps", status: "error", note: "osv-scanner produced no parseable output" }),
+    ];
+    expect(computePass(results, "high")).toBe(false);
   });
 });
 

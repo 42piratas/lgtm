@@ -29,6 +29,21 @@ vi.mock("../../src/util/docker.js", () => ({
   containerReachableUrl: (u: string) => u,
 }));
 
+// tls.ts resolves the target's addresses so it can pin ONE deterministic
+// endpoint (42L-973 #7 — testssl.sh otherwise loops every resolved IP and
+// emits every finding twice). Left unmocked that is real DNS from the unit
+// suite: slow, offline-hostile, and it makes assertions depend on how many
+// A-records a third party happens to publish today. Default: a single address,
+// i.e. the ordinary case. Tests that care about the multi-endpoint path set
+// `resolvedIps` themselves.
+let resolvedIps: string[] = ["93.184.216.34"];
+vi.mock("node:dns", () => ({
+  promises: {
+    resolve4: async () => resolvedIps,
+    resolve6: async () => [],
+  },
+}));
+
 const { tlsRunner } = await import("../../src/runners/tls.js");
 const { depsRunner } = await import("../../src/runners/deps.js");
 const { secretsRunner } = await import("../../src/runners/secrets.js");
@@ -42,6 +57,7 @@ beforeEach(() => {
   dockerRunMock.mockReset();
   hasDockerMock.mockReset();
   hasDockerMock.mockResolvedValue(true); // Docker is UP for every test here
+  resolvedIps = ["93.184.216.34"]; // single-endpoint host unless a test says otherwise
   // tls/zap write their scanner output into a dir under process.cwd(); point
   // cwd at a temp dir so nothing is written into the repo.
   workRoot = mkdtempSync(join(tmpdir(), "lgtm-docker-parse-"));
@@ -327,7 +343,11 @@ describe("sast.ts — semgrep severity mapping", () => {
   // Fixing it is a src/runners/sast.ts behavior change, which the concurrent
   // runner-bugs branch owns. Written to the correct post-fix expectation and
   // left skipped rather than fixed here or faked green.
-  it.skip("does not report a clean scan when semgrep crashed with no JSON output at all — needs a runner-side fix", async () => {
+  // Was it.skip pending the runner-side fix — 42L-973 #8 shipped it: no `{` in
+  // stdout at all (the shape a crashed/killed container leaves) is now an
+  // error, not a silent "sast-ok". This is the test that would have caught a
+  // gate going green on a repo that was never scanned.
+  it("does not report a clean scan when semgrep crashed with no JSON output at all", async () => {
     dockerRunMock.mockResolvedValue({
       code: 2,
       stdout: "",
@@ -465,5 +485,78 @@ describe("zap.ts — riskcode mapping", () => {
     dockerRunMock.mockResolvedValue(ok(""));
     const r = await zapRunner.run(ctx());
     expect(r.status).toBe("error");
+  });
+});
+
+// ── 42L-973 #7: multi-endpoint hosts ───────────────────────────────────────
+//
+// testssl.sh loops the whole scan over EVERY resolved address unless told
+// otherwise, concatenating the results — which is exactly why ds.42labs.io and
+// 42piratas.com (both Cloudflare, both multi-IP) reported every TLS finding
+// twice. Adversarial review then pointed out that the first fix (`--ip one`)
+// stops the duplication but picks whichever address DNS happens to return
+// first: non-deterministic across CI machines, and silent about the fact that
+// other endpoints exist. So: pin the lowest sorted address, and say so.
+
+describe("tlsRunner — endpoint pinning on multi-IP hosts (bug #7)", () => {
+  function tlsWrites(entries: unknown[]) {
+    dockerRunMock.mockImplementation(async (opts: { mountsRW?: Record<string, string> }) => {
+      const dir = opts.mountsRW?.["/wrk"]!;
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "out.json"), JSON.stringify(entries));
+      return ok("");
+    });
+  }
+
+  it("pins ONE deterministic endpoint — the lowest address in sorted order, not 'whatever DNS said first'", async () => {
+    resolvedIps = ["104.21.90.166", "172.67.158.51"];
+    tlsWrites([]);
+    await tlsRunner.run(ctx());
+
+    const args = (dockerRunMock.mock.calls[0]![0] as { args: string[] }).args;
+    const ip = args[args.indexOf("--ip") + 1];
+    expect(ip).toBe("104.21.90.166"); // lowest sorted, regardless of DNS order
+    // The hostname is still the scan target, so SNI/cert checks see the real name.
+    expect(args[args.length - 1]).toBe("example.com");
+  });
+
+  it("picks the same endpoint no matter what order DNS returns the addresses in", async () => {
+    resolvedIps = ["172.67.158.51", "104.21.90.166"]; // reversed
+    tlsWrites([]);
+    await tlsRunner.run(ctx());
+    const args = (dockerRunMock.mock.calls[0]![0] as { args: string[] }).args;
+    expect(args[args.indexOf("--ip") + 1]).toBe("104.21.90.166");
+  });
+
+  it("states its own coverage on a multi-endpoint host rather than implying it scanned everything", async () => {
+    resolvedIps = ["104.21.90.166", "172.67.158.51"];
+    tlsWrites([]);
+    const r = await tlsRunner.run(ctx());
+
+    const coverage = r.findings.find((f) => f.id === "tls-endpoint-coverage")!;
+    expect(coverage).toBeDefined();
+    expect(coverage.severity).toBe("info"); // never fails the build
+    expect(coverage.needsReview).toBe(true); // but stays visible
+    expect(coverage.title).toMatch(/1 of 2 resolved endpoints/);
+    expect(r.meta).toMatchObject({ endpointsResolved: 2, endpointScanned: "104.21.90.166" });
+  });
+
+  it("says nothing about coverage on an ordinary single-endpoint host — no noise", async () => {
+    resolvedIps = ["93.184.216.34"];
+    tlsWrites([]);
+    const r = await tlsRunner.run(ctx());
+    expect(r.findings.find((f) => f.id === "tls-endpoint-coverage")).toBeUndefined();
+    expect(r.note).toBeUndefined();
+  });
+
+  it("de-dupes identical (id, finding) pairs even if the scanner still emits them twice", async () => {
+    // Defense in depth: the --ip pin is not the only thing standing between us
+    // and a duplicated report.
+    tlsWrites([
+      { id: "BREACH", severity: "MEDIUM", finding: "potentially VULNERABLE" },
+      { id: "BREACH", severity: "MEDIUM", finding: "potentially VULNERABLE" },
+    ]);
+    const r = await tlsRunner.run(ctx());
+    expect(r.findings.filter((f) => f.id === "tls-BREACH")).toHaveLength(1);
   });
 });

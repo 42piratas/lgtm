@@ -21,6 +21,20 @@ import type { RunnerContext, SiteConfig } from "../../src/types.js";
 // assert relative order, not just call counts.
 const callOrder: string[] = [];
 
+// The computed style each fake page hands back to a11y.ts's $eval probe.
+// Default: no stroke at all, so contrast findings behave exactly as they did
+// before the -webkit-text-stroke work (42L-973 #5) — the stroke path is opt-in
+// per-test via `nextStrokeStyle`.
+const NO_STROKE_STYLE = {
+  strokeWidth: "0px",
+  color: "rgb(0, 0, 0)",
+  fontSize: "16px",
+  fontWeight: "400",
+  bgColors: ["rgb(255, 255, 255)"],
+  bgImages: ["none"],
+};
+let nextStrokeStyle: Record<string, unknown> = NO_STROKE_STYLE;
+
 function makeFakePage(): Record<string, unknown> {
   return {
     goto: vi.fn().mockResolvedValue({}),
@@ -29,6 +43,11 @@ function makeFakePage(): Record<string, unknown> {
       callOrder.push("evaluate");
       return undefined;
     }),
+    // a11y.ts reads each flagged node's computed style through page.$eval to
+    // decide whether axe misread a -webkit-text-stroke as the foreground.
+    // A real Playwright Page has $eval; this mock must too, or the runner
+    // throws and every a11y test silently degrades into asserting nothing.
+    $eval: vi.fn().mockImplementation(async () => nextStrokeStyle),
     close: vi.fn().mockResolvedValue(undefined),
   };
 }
@@ -51,6 +70,18 @@ class FakeBrowserSession {
 
 vi.mock("../../src/util/browser.js", () => ({
   BrowserSession: FakeBrowserSession,
+}));
+
+// a11y.ts probes the target before launching a browser, to refuse auth-gated
+// or non-2xx responses (42L-973 #1/#2). Left unmocked that is a REAL network
+// call to example.com from the unit suite — slow, flaky, and offline-hostile.
+// The probe's own logic is tested directly in test/util/authgate.test.ts.
+let probeResult: { ok: boolean; note?: string } = { ok: true, status: 200 } as {
+  ok: boolean;
+  note?: string;
+};
+vi.mock("../../src/util/authgate.js", () => ({
+  probeTarget: async () => probeResult,
 }));
 
 // Same reasoning as FakeBrowserSession above: a real class so `new
@@ -112,6 +143,8 @@ beforeEach(() => {
   nextViolations = [];
   authRequestedButMissing = false;
   callOrder.length = 0;
+  nextStrokeStyle = NO_STROKE_STYLE;
+  probeResult = { ok: true };
 });
 
 describe("a11yRunner — IMPACT_TO_SEVERITY mapping", () => {
@@ -224,5 +257,90 @@ describe("a11yRunner — regression guard for the reveal-on-scroll false negativ
     expect(callOrder.filter((c) => c === "analyze")).toHaveLength(1);
     expect(callOrder.indexOf("analyze")).toBe(callOrder.length - 1);
     expect(callOrder.slice(0, -1).every((c) => c === "evaluate")).toBe(true);
+  });
+});
+
+// ── 42L-973 #5: -webkit-text-stroke contrast ────────────────────────────────
+//
+// axe reads the stroke colour as the foreground instead of the text fill, so a
+// compliant node gets reported failing. The fix downgrades those to a visible
+// "needs review" note — but ONLY when the real fill/background ratio actually
+// passes. Downgrading every stroked node would trade a false positive for a
+// false negative, which is the worse bug; these tests pin both directions.
+
+describe("a11yRunner — -webkit-text-stroke contrast (bug #5)", () => {
+  const strokedButCompliant = {
+    strokeWidth: "3px",
+    color: "rgb(74, 74, 74)", // #4A4A4A on white ≈ 8.59:1 — genuinely passes
+    fontSize: "28px",
+    fontWeight: "600",
+    bgColors: ["rgba(0, 0, 0, 0)", "rgb(255, 255, 255)"],
+    bgImages: ["none", "none"],
+  };
+  const strokedAndGenuinelyBad = {
+    strokeWidth: "2px",
+    color: "rgb(221, 221, 221)", // #DDDDDD on white ≈ 1.3:1 — genuinely fails
+    fontSize: "16px",
+    fontWeight: "400",
+    bgColors: ["rgba(0, 0, 0, 0)", "rgb(255, 255, 255)"],
+    bgImages: ["none", "none"],
+  };
+
+  it("downgrades a stroked node whose REAL fill contrast passes to a visible needs-review note, not a hard failure", async () => {
+    nextStrokeStyle = strokedButCompliant;
+    nextViolations = [[violation("color-contrast", "serious", "h1")]];
+    const result = await a11yRunner.run(ctx(["https://example.com"]));
+
+    // No hard contrast failure...
+    expect(result.findings.find((f) => f.id === "a11y-color-contrast")).toBeUndefined();
+    // ...but absolutely not dropped either.
+    const review = result.findings.find((f) => f.id === "a11y-color-contrast-text-stroke")!;
+    expect(review).toBeDefined();
+    expect(review.needsReview).toBe(true);
+    expect(review.severity).toBe("info"); // never counts toward failOn
+    expect(review.title).toMatch(/-webkit-text-stroke/);
+  });
+
+  it("KEEPS a hard failure when the stroked node's real fill contrast is genuinely bad — no false negative", async () => {
+    nextStrokeStyle = strokedAndGenuinelyBad;
+    nextViolations = [[violation("color-contrast", "serious", "p")]];
+    const result = await a11yRunner.run(ctx(["https://example.com"]));
+
+    const hard = result.findings.find((f) => f.id === "a11y-color-contrast")!;
+    expect(hard).toBeDefined();
+    expect(hard.severity).toBe("high");
+    expect(hard.needsReview).toBeFalsy();
+    expect(result.findings.find((f) => f.id === "a11y-color-contrast-text-stroke")).toBeUndefined();
+  });
+
+  it("leaves an unstroked contrast violation completely alone", async () => {
+    nextStrokeStyle = NO_STROKE_STYLE;
+    nextViolations = [[violation("color-contrast", "serious", "#x")]];
+    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    expect(result.findings.find((f) => f.id === "a11y-color-contrast")!.severity).toBe("high");
+    expect(result.findings.find((f) => f.id === "a11y-color-contrast-text-stroke")).toBeUndefined();
+  });
+
+  it("does not touch non-contrast rules even on a stroked element", async () => {
+    nextStrokeStyle = strokedButCompliant;
+    nextViolations = [[violation("link-name", "serious", "a")]];
+    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    expect(result.findings.find((f) => f.id === "a11y-link-name")!.severity).toBe("high");
+  });
+});
+
+// ── 42L-973 #1/#2: refuse to score a gated / unfetchable target ─────────────
+describe("a11yRunner — refuses to score when the probe says the target isn't the site", () => {
+  it("errors instead of scanning when the target is behind an auth gate", async () => {
+    probeResult = {
+      ok: false,
+      note: "refusing to score — redirected to a known auth gate (labs42.cloudflareaccess.com)",
+    };
+    nextViolations = [[violation("color-contrast", "serious", "#x")]];
+    const result = await a11yRunner.run(ctx(["https://ds.example.com"]));
+    expect(result.status).toBe("error");
+    expect(result.note).toMatch(/auth gate/);
+    // It must NOT have produced a grade-able finding list off someone else's page.
+    expect(result.findings).toHaveLength(0);
   });
 });
