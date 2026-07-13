@@ -78,6 +78,32 @@ async function revealLazyContent(page: import("playwright").Page): Promise<void>
     .catch(() => {});
 }
 
+// axe's color-contrast check reads the CSS `color` computed style as "the
+// foreground". When an element has a -webkit-text-stroke, some renderers'
+// paint order means axe samples the *stroke* color instead of the actual
+// text fill — a node whose real fill/background ratio is 8.59:1 (compliant)
+// gets reported failing at 2.19:1 (the stroke color's ratio). Reproduced on
+// two separate repos.
+//
+// We can't fix axe's sampling, but we can tell when it's unreliable: any
+// node with a non-none/non-zero -webkit-text-stroke gets its contrast
+// finding downgraded to "needs manual review" rather than a hard failure —
+// never silently dropped, always with the reason stated.
+async function hasTextStroke(
+  page: import("playwright").Page,
+  target: unknown,
+): Promise<boolean> {
+  if (!Array.isArray(target) || target.length === 0) return false;
+  const selector = target[target.length - 1];
+  if (typeof selector !== "string") return false;
+  return page
+    .$eval(selector, (el) => {
+      const width = getComputedStyle(el).getPropertyValue("-webkit-text-stroke-width").trim();
+      return width !== "" && width !== "0px" && width !== "0";
+    })
+    .catch(() => false);
+}
+
 export const a11yRunner: Runner = {
   id: "a11y",
   domain: "a11y",
@@ -135,9 +161,48 @@ export const a11yRunner: Runner = {
             .analyze();
 
           for (const v of results.violations) {
-            if (v.id === "color-contrast") contrastNodes += v.nodes.length;
+            let nodes = v.nodes;
+            let strokeNodes: typeof v.nodes = [];
+
+            if (v.id === "color-contrast") {
+              const partitioned = await Promise.all(
+                v.nodes.map(async (node) => ({
+                  node,
+                  stroke: await hasTextStroke(page, node.target),
+                })),
+              );
+              nodes = partitioned.filter((p) => !p.stroke).map((p) => p.node);
+              strokeNodes = partitioned.filter((p) => p.stroke).map((p) => p.node);
+              contrastNodes += v.nodes.length;
+            }
+
+            if (strokeNodes.length > 0) {
+              const target = strokeNodes[0]?.target?.join(" ") ?? "";
+              const key = `a11y-color-contrast-text-stroke::${target}`;
+              if (seen.has(key)) {
+                seen.get(key)!.count++;
+              } else {
+                seen.set(key, {
+                  count: 1,
+                  finding: {
+                    id: "a11y-color-contrast-text-stroke",
+                    title: `${strokeNodes.length} node${strokeNodes.length === 1 ? "" : "s"} use -webkit-text-stroke — the contrast checker reads the stroke colour as the foreground instead of the actual text fill`,
+                    severity: "info",
+                    needsReview: true,
+                    standard: "WCAG 1.4.3 (needs manual verification)",
+                    location: `${url} ${target}`.trim(),
+                    remediation:
+                      "Verify contrast manually against the real text-fill `color` vs `background-color` (not the stroke). If the fill/background ratio meets 4.5:1, this is a false positive.",
+                    evidence: strokeNodes[0]?.html?.slice(0, 240),
+                  },
+                });
+              }
+            }
+
+            if (nodes.length === 0) continue; // every node here was stroke-affected
+
             const sev = IMPACT_TO_SEVERITY[v.impact ?? "minor"] ?? "low";
-            const target = v.nodes[0]?.target?.join(" ") ?? "";
+            const target = nodes[0]?.target?.join(" ") ?? "";
             const key = `${v.id}::${target}`;
             if (seen.has(key)) {
               seen.get(key)!.count++;
@@ -147,12 +212,12 @@ export const a11yRunner: Runner = {
               count: 1,
               finding: {
                 id: `a11y-${v.id}`,
-                title: `${v.help} (${v.nodes.length} node${v.nodes.length === 1 ? "" : "s"})`,
+                title: `${v.help} (${nodes.length} node${nodes.length === 1 ? "" : "s"})`,
                 severity: sev,
                 standard: (v.tags.find((t) => t.startsWith("wcag")) ?? "WCAG").toUpperCase(),
                 location: `${url} ${target}`.trim(),
                 remediation: v.helpUrl,
-                evidence: v.nodes[0]?.html?.slice(0, 240),
+                evidence: nodes[0]?.html?.slice(0, 240),
               },
             });
           }

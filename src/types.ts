@@ -41,6 +41,14 @@ export interface Finding {
   remediation?: string;
   /** Raw supporting detail (header value, matched line, node HTML). */
   evidence?: string;
+  /**
+   * This is not a confirmed pass or fail — a human needs to look. Used e.g.
+   * when a contrast checker's input is known-unreliable (-webkit-text-stroke
+   * confusing fill color with stroke color). Always paired with
+   * severity: "info" (never counted toward failOn/grade) but, unlike a plain
+   * pass-note, still rendered in the report — it must not be silently dropped.
+   */
+  needsReview?: boolean;
 }
 
 export type RunnerStatus = "ok" | "skipped" | "error";

@@ -1,8 +1,8 @@
 import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import pc from "picocolors";
-import type { AuditReport, RunnerResult, Severity } from "./types.js";
-import { gradeFor } from "./scoring.js";
+import type { AuditReport, Finding, RunnerResult, Severity } from "./types.js";
+import { gradeFor, realFindings } from "./scoring.js";
 
 const SEV_COLOR: Record<Severity, (s: string) => string> = {
   critical: pc.magenta,
@@ -21,6 +21,10 @@ const SEV_CHIP: Record<Severity, { bg: string; border: string; text: string }> =
   low: { bg: "#EFF6FF", border: "#BFDBFE", text: "#2563EB" },
   info: { bg: "#F0FDF4", border: "#DCFCE7", text: "#166534" },
 };
+
+// "Needs manual review" is neither a pass-note nor a real severity — it gets
+// its own distinct violet treatment so it can't be mistaken for either.
+const REVIEW_CHIP = { bg: "#F5F3FF", border: "#DDD6FE", text: "#5B21B6" };
 
 // Letter grade → solid chip colour (DS palette).
 const GRADE_HEX: Record<string, string> = {
@@ -58,7 +62,7 @@ export function consoleSummary(report: AuditReport): string {
   lines.push("");
   lines.push(pc.dim("  domain          grade  issues"));
   for (const r of report.results) {
-    const n = r.findings.filter((f) => f.severity !== "info").length;
+    const n = realFindings(r.findings).length;
     const grade = gradeFor(r);
     const gcol =
       grade === "A" ? pc.green : grade === "F" || grade === "D" ? pc.red : grade === "—" || grade === "?" ? pc.dim : pc.yellow;
@@ -111,6 +115,8 @@ function sevBreakdown(r: RunnerResult): string {
   (["critical", "high", "medium", "low"] as Severity[]).forEach((s) => {
     if (c[s]) parts.push(SEV_COLOR[s](`${c[s]}${s[0]}`));
   });
+  const reviewCount = r.findings.filter((f) => f.needsReview).length;
+  if (reviewCount) parts.push(pc.cyan(`${reviewCount}r`));
   return parts.join(" ");
 }
 
@@ -124,7 +130,7 @@ const FAVICON =
   "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9Im5vIj8+CjwhRE9DVFlQRSBzdmcgUFVCTElDICItLy9XM0MvL0RURCBTVkcgMS4xLy9FTiIgImh0dHA6Ly93d3cudzMub3JnL0dyYXBoaWNzL1NWRy8xLjEvRFREL3N2ZzExLmR0ZCI+Cjxzdmcgd2lkdGg9IjEwMCUiIGhlaWdodD0iMTAwJSIgdmlld0JveD0iMCAwIDQwNyA0MDIiIHZlcnNpb249IjEuMSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4bWxuczp4bGluaz0iaHR0cDovL3d3dy53My5vcmcvMTk5OS94bGluayIgeG1sOnNwYWNlPSJwcmVzZXJ2ZSIgeG1sbnM6c2VyaWY9Imh0dHA6Ly93d3cuc2VyaWYuY29tLyIgc3R5bGU9ImZpbGwtcnVsZTpldmVub2RkO2NsaXAtcnVsZTpldmVub2RkO3N0cm9rZS1saW5lam9pbjpyb3VuZDtzdHJva2UtbWl0ZXJsaW1pdDoyOyI+PHN0eWxlPnBhdGh7ZmlsbDojMDAwfUBtZWRpYSAocHJlZmVycy1jb2xvci1zY2hlbWU6ZGFyayl7cGF0aHtmaWxsOiNmZmZ9fTwvc3R5bGU+CiAgICA8ZyB0cmFuc2Zvcm09Im1hdHJpeCgxLDAsMCwxLC0xNjQ1LjgxLC02OTUuNDQyKSI+CiAgICAgICAgPGcgdHJhbnNmb3JtPSJtYXRyaXgoMSwwLDAsMSwxNjExLjY4LDY2Ni45MDgpIj4KICAgICAgICAgICAgPHBhdGggZD0iTTMwNy43MTksMjguNTM0TDM3Ni41MzYsNjcuNjk4TDI2Ny45OTUsMjEzLjE2NUw0NDAuODc3LDE5MC4yMjZMNDQwLjg3NywyNjcuOTk1TDI2Ny45OTUsMjQ3LjI5NEwyNjcuOTk1LDI0OS41MzJMMzc3LjY1NSwzODguMjg1TDMwNS40ODEsNDI4LjU2OUwyMzYuNjY0LDI2Ny45OTVMMjM0LjQyNiwyNjcuOTk1TDE2MC4wMTQsNDI5LjY4OEw5NS4xMTMsMzg4LjI4NUwyMDMuNjU0LDI0Ni4xNzVMMzQuMTI5LDI2Ny45OTVMMzQuMTI5LDE5MC4yMjZMMjAyLjUzNSwyMTIuMDQ2TDIwMi41MzUsMjA5LjgwOEw5NS4xMTMsNjguODE3TDE2NC40OSwyOS42NTNMMjM1LjU0NSwxODkuMTA3TDIzOC4zNDIsMTg5LjEwN0wzMDcuNzE5LDI4LjUzNFoiLz4KICAgICAgICA8L2c+CiAgICA8L2c+Cjwvc3ZnPgo=";
 
 function realCount(r: RunnerResult): number {
-  return r.findings.filter((f) => f.severity !== "info").length;
+  return realFindings(r.findings).length;
 }
 
 // ── 42labs Design System — light theme HTML report ───────────────────────────
@@ -216,23 +222,30 @@ function renderOverview(report: AuditReport): string {
   </table></div>`;
 }
 
+function chipFor(f: Finding): string {
+  if (f.needsReview) {
+    return `<span class="chip review" style="background:${REVIEW_CHIP.bg};border-color:${REVIEW_CHIP.border};color:${REVIEW_CHIP.text}">needs review</span>`;
+  }
+  return `<span class="chip" style="background:${SEV_CHIP[f.severity].bg};border-color:${SEV_CHIP[f.severity].border};color:${SEV_CHIP[f.severity].text}">${f.severity}</span>`;
+}
+
 function renderRunnerSection(r: RunnerResult, index: number): string {
-  const issues = r.findings.filter((f) => f.severity !== "info");
+  const issues = realFindings(r.findings);
   const num = String(index + 1).padStart(2, "0");
   const grade = gradeFor(r);
 
   let body: string;
   if (r.status === "skipped") {
-    body = `<p class="empty">Skipped${r.note ? ` — ${esc(r.note)}` : ""}.</p>`;
+    body = `<p class="empty skip">Skipped — no coverage${r.note ? `: ${esc(r.note)}` : ""}.</p>`;
   } else if (r.status === "error") {
-    body = `<p class="empty err">Errored${r.note ? ` — ${esc(r.note)}` : ""}.</p>`;
+    body = `<p class="empty err">Refused to score${r.note ? ` — ${esc(r.note)}` : ""}.</p>`;
   } else if (issues.length === 0) {
     body = `<p class="empty ok">Clean${r.note ? ` — ${esc(r.note)}` : " — no findings"}.</p>`;
   } else {
     const rows = issues
       .map(
         (f) => `<tr>
-        <td><span class="chip" style="background:${SEV_CHIP[f.severity].bg};border-color:${SEV_CHIP[f.severity].border};color:${SEV_CHIP[f.severity].text}">${f.severity}</span></td>
+        <td>${chipFor(f)}</td>
         <td class="find">${esc(f.title)}${f.standard ? `<div class="std">${esc(f.standard)}</div>` : ""}</td>
         <td class="loc">${f.location ? esc(f.location) : ""}</td>
         <td class="rem">${f.remediation ? esc(f.remediation) : ""}</td>
