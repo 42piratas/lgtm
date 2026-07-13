@@ -13,6 +13,34 @@ const IMPACT_TO_SEVERITY: Record<string, Finding["severity"]> = {
   minor: "low",
 };
 
+// axe samples computed styles at the instant it runs. If a CSS transition on
+// color/background-color is still animating, it reads a *blended* mid-transition
+// value and reports a contrast violation against a color the user never sees —
+// a node whose settled ratio is 5.97:1 gets flagged as failing. Firing right
+// after `load` is squarely inside that window, so every scanned page with a
+// color transition produced false contrast findings.
+//
+// Wait for the animations the page itself declares: resolve when every running
+// Animation settles, capped so a decorative infinite loop can't hang the run.
+const SETTLE_CAP_MS = 2_000;
+
+async function settleTransitions(page: import("playwright").Page): Promise<void> {
+  await page
+    .evaluate(async (cap: number) => {
+      const running = document
+        .getAnimations()
+        .filter((a) => a.playState === "running")
+        .map((a) => a.finished.catch(() => undefined));
+      if (running.length === 0) return;
+      // Infinite animations never settle — never let them hold the scan open.
+      await Promise.race([
+        Promise.allSettled(running),
+        new Promise((r) => setTimeout(r, cap)),
+      ]);
+    }, SETTLE_CAP_MS)
+    .catch(() => {});
+}
+
 export const a11yRunner: Runner = {
   id: "a11y",
   domain: "a11y",
@@ -40,6 +68,7 @@ export const a11yRunner: Runner = {
           await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
           // Let late-mounted client UI settle without hanging on long-poll/analytics.
           await page.waitForLoadState("load", { timeout: 10_000 }).catch(() => {});
+          await settleTransitions(page);
           const results = await new AxeBuilder({ page })
             .withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"])
             .analyze();
