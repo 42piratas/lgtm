@@ -51,9 +51,33 @@ export const depsRunner: Runner = {
       return skip(this, start, "docker unavailable (osv-scanner image needs it)");
     }
 
+    // osv-scanner respects the repo's .gitignore by default. That's correct
+    // for build output, but real lockfiles are routinely gitignored too —
+    // e.g. a Jekyll repo's Gemfile.lock (42piratas.com) — and get silently
+    // excluded from the walk entirely: "No package sources found", the
+    // *entire* ecosystem goes unaudited, and it looks like a tool error
+    // rather than a coverage hole. --no-ignore restores them. The same
+    // gitignore rule ordinarily hides node_modules, .git, and (in this
+    // fleet's convention) .worktrees/ — --no-ignore would otherwise pull
+    // those back in too (vendor noise, or duplicate scans of stale worktree
+    // checkouts), so exclude them explicitly instead.
     const r = await dockerRun({
       image: IMAGE,
-      args: ["scan", "source", "--recursive", "--format", "json", "/src"],
+      args: [
+        "scan",
+        "source",
+        "--recursive",
+        "--no-ignore",
+        "--experimental-exclude",
+        "r:node_modules",
+        "--experimental-exclude",
+        "r:\\.git",
+        "--experimental-exclude",
+        "r:\\.worktrees",
+        "--format",
+        "json",
+        "/src",
+      ],
       mounts: { "/src": repo },
       timeoutMs: 300_000,
     });
