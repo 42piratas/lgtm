@@ -1,4 +1,5 @@
 import { exec, which } from "./exec.js";
+import { withRetry, isTransientFailure } from "./retry.js";
 
 let dockerAvailable: boolean | null = null;
 
@@ -56,7 +57,16 @@ export async function dockerRun(opts: DockerRunOpts) {
   if (workdir) runArgs.push("-w", workdir);
   runArgs.push(...extra, image, ...args);
 
-  return exec("docker", runArgs, { timeoutMs });
+  // Bounded retry for transient container failures (image-pull timeout,
+  // registry throttle, killed container, network blip mid-scan). See
+  // util/retry.ts for the full policy — a permanent failure (bad image tag,
+  // bad flags) is not retried, and whatever survives still errors and fails
+  // the run. We must never silently pass a crash; we also must not fail a
+  // build over a 300ms hiccup.
+  return withRetry(
+    () => exec("docker", runArgs, { timeoutMs }),
+    (r) => r.code !== 0 && (r.timedOut || isTransientFailure(r.stderr || r.stdout)),
+  );
 }
 
 /**

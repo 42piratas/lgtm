@@ -1,6 +1,11 @@
 import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
-import { fetchUrl, isLocalhostUrl } from "../util/http.js";
-import { detectAuthGate, badStatusReason } from "../util/authgate.js";
+import { isLocalhostUrl } from "../util/http.js";
+import {
+  detectAuthGate,
+  badStatusReason,
+  fetchTarget,
+  unreachableNote,
+} from "../util/authgate.js";
 
 // Security-header expectations, aligned with the OWASP Secure Headers Project
 // and Mozilla Observatory. Each check is evaluated against the base URL's
@@ -118,19 +123,20 @@ export const headersRunner: Runner = {
     const start = Date.now();
     const findings: Finding[] = [];
     const url = ctx.run.baseUrl;
-    let res;
-    try {
-      res = await fetchUrl(url, { timeoutMs: 30_000 });
-    } catch (err) {
+    // Transport failures get a bounded retry before we conclude anything (see
+    // util/retry.ts); a bad *status* does not — that's a definite answer.
+    const attempt = await fetchTarget(url);
+    if (!attempt.res) {
       return {
         runnerId: this.id,
         domain: this.domain,
         status: "error",
-        note: `fetch failed: ${(err as Error).message}`,
+        note: unreachableNote(url, attempt.err),
         findings,
         durationMs: Date.now() - start,
       };
     }
+    const res = attempt.res;
 
     // Refuse to score whatever landed if it isn't actually the configured
     // target: an auth-gate redirect (Cloudflare Access, Vercel SSO, Okta,
