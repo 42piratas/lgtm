@@ -31,12 +31,23 @@ export function tallySeverities(results: RunnerResult[]): Record<Severity, numbe
   return totals;
 }
 
-/** A run passes when no finding is at or above the site's failOn threshold. */
+/**
+ * A run passes when no runner errored AND no finding is at or above the
+ * site's failOn threshold.
+ *
+ * A runner in status "error" could not actually see the site (auth gate,
+ * bad HTTP status, tool crash, misconfigured scan) — it has no findings to
+ * evaluate, but "no findings" here means "unknown", not "clean". Letting an
+ * errored runner pass silently is exactly how a scanner ends up reporting a
+ * false all-clear: it must not be reportable as anything other than a
+ * failure.
+ */
 export function computePass(
   results: RunnerResult[],
   failOn: Severity,
 ): boolean {
   for (const r of results) {
+    if (r.status === "error") return false;
     for (const f of r.findings) {
       if (f.severity !== "info" && atLeastAsSevere(f.severity, failOn)) {
         return false;

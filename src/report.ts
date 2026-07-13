@@ -66,21 +66,39 @@ export function consoleSummary(report: AuditReport): string {
       r.status === "error"
         ? pc.red(`error${r.note ? ` — ${r.note}` : ""}`)
         : r.status === "skipped"
-          ? pc.dim(`skipped${r.note ? ` — ${r.note}` : ""}`)
+          ? pc.yellow(`skipped${r.note ? ` — ${r.note}` : ""}`)
           : n > 0
             ? sevBreakdown(r)
             : pc.green("clean");
     lines.push(`  ${r.runnerId.padEnd(14)}  ${gcol(grade.padEnd(5))}  ${detail}`);
   }
   lines.push("");
+
+  const errored = report.results.filter((r) => r.status === "error");
+  const skipped = report.results.filter((r) => r.status === "skipped");
+  if (skipped.length > 0) {
+    lines.push(
+      pc.yellow(
+        `  ${skipped.length} runner${skipped.length === 1 ? "" : "s"} skipped — no coverage: ${skipped
+          .map((r) => `${r.runnerId} (${r.note ?? "no reason given"})`)
+          .join("; ")}`,
+      ),
+    );
+  }
+
   const t = report.totals;
   lines.push(
     `  totals: ${SEV_COLOR.critical(`${t.critical} critical`)} · ${SEV_COLOR.high(`${t.high} high`)} · ${SEV_COLOR.medium(`${t.medium} medium`)} · ${SEV_COLOR.low(`${t.low} low`)}`,
   );
   lines.push(
     report.passed
-      ? pc.green(`  PASS `) + pc.dim(`(no findings ≥ ${report.failOn})`)
-      : pc.red(`  FAIL `) + pc.dim(`(findings ≥ ${report.failOn} threshold)`),
+      ? pc.green(`  PASS `) + pc.dim(`(no findings ≥ ${report.failOn}, no runner errors)`)
+      : pc.red(`  FAIL `) +
+          pc.dim(
+            errored.length > 0
+              ? `(${errored.length} runner${errored.length === 1 ? "" : "s"} errored: ${errored.map((r) => r.runnerId).join(", ")}${countAtOrAbove(report) ? ` · findings ≥ ${report.failOn}` : ""})`
+              : `(findings ≥ ${report.failOn} threshold)`,
+          ),
   );
   lines.push("");
   return lines.join("\n");
@@ -125,12 +143,31 @@ function renderMasthead(report: AuditReport): string {
 function renderVerdict(report: AuditReport): string {
   const t = report.totals;
   const atOrAbove = countAtOrAbove(report);
+  const errored = report.results.filter((r) => r.status === "error");
   const cls = report.passed ? "pass" : "fail";
-  const text = report.passed
-    ? `PASS — no findings at or above <b>${report.failOn}</b>`
-    : `FAIL — ${atOrAbove} finding${atOrAbove === 1 ? "" : "s"} at or above <b>${report.failOn}</b>`;
+  let text: string;
+  if (report.passed) {
+    text = `PASS — no findings at or above <b>${report.failOn}</b>, no runner errors`;
+  } else if (errored.length > 0) {
+    const ids = errored.map((r) => esc(r.runnerId)).join(", ");
+    text = `FAIL — ${errored.length} runner${errored.length === 1 ? "" : "s"} errored (<b>${ids}</b>) — a scan that couldn't see the site is not a clean bill of health${atOrAbove ? `, plus ${atOrAbove} finding${atOrAbove === 1 ? "" : "s"} at or above <b>${report.failOn}</b>` : ""}`;
+  } else {
+    text = `FAIL — ${atOrAbove} finding${atOrAbove === 1 ? "" : "s"} at or above <b>${report.failOn}</b>`;
+  }
   return `<div class="verdict ${cls}"><span class="badge ${cls}">${report.passed ? "PASS" : "FAIL"}</span> ${text}
     <span class="vsum">${t.critical + t.high} high-severity · ${t.medium} medium · ${t.low} low</span></div>`;
+}
+
+/** Skips must be visible and reasoned — a callout, not a greyed-out row that
+ *  blends into a table full of "clean" results. */
+function renderCoverage(report: AuditReport): string {
+  const skipped = report.results.filter((r) => r.status === "skipped");
+  if (skipped.length === 0) return "";
+  const items = skipped
+    .map((r) => `<li><b>${esc(r.runnerId)}</b> — ${esc(r.note ?? "no reason given")}</li>`)
+    .join("");
+  return `<div class="coverage"><b>${skipped.length} runner${skipped.length === 1 ? "" : "s"} not run — no coverage here:</b>
+    <ul>${items}</ul></div>`;
 }
 
 function renderKpis(report: AuditReport): string {
@@ -157,9 +194,9 @@ function renderOverview(report: AuditReport): string {
       const n = realCount(r);
       const status =
         r.status === "error"
-          ? `<span class="tag err">error</span>`
+          ? `<span class="tag err">error — refused to score</span>`
           : r.status === "skipped"
-            ? `<span class="tag muted">skipped</span>`
+            ? `<span class="tag skip">skipped — no coverage</span>`
             : n > 0
               ? `<span class="tag warn">${n} finding${n === 1 ? "" : "s"}</span>`
               : `<span class="tag ok">clean</span>`;
@@ -264,6 +301,12 @@ function renderHtml(report: AuditReport): string {
   .verdict b{font-weight:600}
   .vsum{font-family:var(--font-mono);font-size:11.5px;color:var(--fg-muted);margin-left:auto}
 
+  .coverage{font-size:13px;color:#9A3412;background:#FFF7ED;border:1px solid #FED7AA;
+    border-left:3px solid #EA580C;border-radius:8px;padding:12px 15px;margin:0 0 16px}
+  .coverage b{font-weight:600}
+  .coverage ul{margin:6px 0 0;padding-left:18px}
+  .coverage li{margin:2px 0;font-family:var(--font-mono);font-size:12px}
+
   .kpis{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0 4px}
   .kpi{flex:1;min-width:120px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:11px 13px}
   .kpi .l{font-family:var(--font-mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--fg-muted)}
@@ -278,7 +321,7 @@ function renderHtml(report: AuditReport): string {
   .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:6px 4px;
     box-shadow:0 1px 2px rgba(28,25,23,.04)}
   .empty{font-size:13px;color:var(--fg-muted);padding:14px 14px;margin:0;font-family:var(--font-mono)}
-  .empty.ok{color:#166534}.empty.err{color:#991B1B}
+  .empty.ok{color:#166534}.empty.err{color:#991B1B}.empty.skip{color:#9A3412}
 
   table{width:100%;border-collapse:collapse;font-size:12.5px}
   thead th{font-family:var(--font-mono);color:var(--accent-2);font-weight:600;font-size:9.5px;letter-spacing:.05em;
@@ -295,7 +338,8 @@ function renderHtml(report: AuditReport): string {
   .grade.sm{width:19px;height:19px;font-size:11px}
   .tag{font-family:var(--font-mono);font-size:11px;padding:2px 9px;border-radius:999px}
   .tag.ok{background:#F0FDF4;color:#166534}.tag.warn{background:#FEFCE8;color:#854D0E}
-  .tag.err{background:#FEF2F2;color:#991B1B}.tag.muted{background:#F5F5F4;color:#756D68}
+  .tag.err{background:#FEF2F2;color:#991B1B}
+  .tag.skip{background:#FFF7ED;color:#9A3412;border:1px solid #FED7AA;font-weight:600}
 
   .findings .chip{font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:.04em;
     padding:2px 8px;border-radius:999px;border:1px solid;white-space:nowrap;font-weight:600}
@@ -314,6 +358,7 @@ function renderHtml(report: AuditReport): string {
 </style></head><body><div class="wrap">
   ${renderMasthead(report)}
   ${renderVerdict(report)}
+  ${renderCoverage(report)}
   ${renderKpis(report)}
   ${renderOverview(report)}
   ${sections}
