@@ -1,5 +1,6 @@
 import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
 import { fetchUrl, isLocalhostUrl } from "../util/http.js";
+import { detectAuthGate, badStatusReason } from "../util/authgate.js";
 
 // Security-header expectations, aligned with the OWASP Secure Headers Project
 // and Mozilla Observatory. Each check is evaluated against the base URL's
@@ -128,6 +129,36 @@ export const headersRunner: Runner = {
         note: `fetch failed: ${(err as Error).message}`,
         findings,
         durationMs: Date.now() - start,
+      };
+    }
+
+    // Refuse to score whatever landed if it isn't actually the configured
+    // target: an auth-gate redirect (Cloudflare Access, Vercel SSO, Okta,
+    // Auth0, ...) or a non-2xx/3xx response (429 bot-protection, 5xx, ...).
+    // Grading either would report someone else's page, or report "no
+    // headers" for a request that was never let through.
+    const gate = detectAuthGate(url, res.finalUrl);
+    if (gate.gated) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: `refusing to score — ${gate.reason}`,
+        findings,
+        durationMs: Date.now() - start,
+        meta: { finalUrl: res.finalUrl, status: res.status },
+      };
+    }
+    const bad = badStatusReason(res.status);
+    if (bad) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: `refusing to score — ${bad}`,
+        findings,
+        durationMs: Date.now() - start,
+        meta: { finalUrl: res.finalUrl, status: res.status },
       };
     }
 

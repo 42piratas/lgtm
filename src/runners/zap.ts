@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, existsSync, rmSync, chmodSync } from "node:fs"
 import { join } from "node:path";
 import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
 import { hasDocker, dockerRun, containerReachableUrl } from "../util/docker.js";
+import { probeTarget } from "../util/authgate.js";
 
 // Dynamic scan via OWASP ZAP (container).
 //   * passive baseline — safe, runs against any reachable target.
@@ -37,6 +38,20 @@ export const zapRunner: Runner = {
   async run(ctx: RunnerContext): Promise<RunnerResult> {
     const start = Date.now();
     const findings: Finding[] = [];
+
+    // Refuse before spending a ZAP container run on content that isn't the
+    // site: an auth-gate redirect or a non-2xx/3xx response.
+    const probe = await probeTarget(ctx.run.baseUrl);
+    if (!probe.ok) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: probe.note,
+        findings,
+        durationMs: Date.now() - start,
+      };
+    }
 
     if (!(await hasDocker())) {
       return skip(this, start, "docker unavailable (ZAP image needs it)");

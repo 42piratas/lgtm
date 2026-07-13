@@ -1,5 +1,6 @@
 import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
 import { fetchUrl, isLocalhostUrl } from "../util/http.js";
+import { detectAuthGate, badStatusReason } from "../util/authgate.js";
 
 // Cookie hygiene + basic CSRF signal, parsed from raw Set-Cookie lines.
 // Aligned with OWASP ASVS 3.4 (cookie-based session management).
@@ -46,6 +47,32 @@ export const cookiesRunner: Runner = {
         domain: this.domain,
         status: "error",
         note: `fetch failed: ${(err as Error).message}`,
+        findings,
+        durationMs: Date.now() - start,
+      };
+    }
+
+    // Same rule as headers: an auth-gate redirect or a non-2xx/3xx response
+    // means we never actually saw the site's cookies — "no cookies found"
+    // would silently misreport as "clean".
+    const gate = detectAuthGate(url, res.finalUrl);
+    if (gate.gated) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: `refusing to score — ${gate.reason}`,
+        findings,
+        durationMs: Date.now() - start,
+      };
+    }
+    const bad = badStatusReason(res.status);
+    if (bad) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: `refusing to score — ${bad}`,
         findings,
         durationMs: Date.now() - start,
       };

@@ -2,6 +2,7 @@ import { launch } from "chrome-launcher";
 import lighthouse from "lighthouse";
 import { readFileSync, existsSync } from "node:fs";
 import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
+import { probeTarget } from "../util/authgate.js";
 
 // Performance / best-practices / SEO via Lighthouse. Category scores below
 // threshold become findings; the numbers land in report meta either way.
@@ -41,6 +42,20 @@ export const lighthouseRunner: Runner = {
     const start = Date.now();
     const findings: Finding[] = [];
     const url = ctx.run.baseUrl;
+
+    // Refuse before spending a Chrome launch on content that isn't the site:
+    // an auth-gate redirect or a non-2xx/3xx response.
+    const probe = await probeTarget(url);
+    if (!probe.ok) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: probe.note,
+        findings,
+        durationMs: Date.now() - start,
+      };
+    }
 
     const chrome = await launch({
       chromeFlags: ["--headless=new", "--no-sandbox", "--ignore-certificate-errors"],

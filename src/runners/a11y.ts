@@ -1,6 +1,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
 import { BrowserSession } from "../util/browser.js";
+import { probeTarget } from "../util/authgate.js";
 
 // Accessibility via axe-core (WCAG 2.0/2.1/2.2 A + AA), driven through a real
 // authenticated browser so app surfaces behind login are covered. Color
@@ -85,6 +86,23 @@ export const a11yRunner: Runner = {
   async run(ctx: RunnerContext): Promise<RunnerResult> {
     const start = Date.now();
     const findings: Finding[] = [];
+
+    // Refuse before launching a browser session on content that isn't the
+    // site: an auth-gate redirect (Cloudflare Access, Vercel SSO, Okta,
+    // Auth0, ...) or a non-2xx/3xx response. Grading either lies about the
+    // site under audit.
+    const probe = await probeTarget(ctx.run.baseUrl);
+    if (!probe.ok) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: probe.note,
+        findings,
+        durationMs: Date.now() - start,
+      };
+    }
+
     const session = new BrowserSession(ctx.site);
     let authNote = "";
     if (session.authRequestedButMissing()) {
