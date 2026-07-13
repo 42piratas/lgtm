@@ -29,7 +29,13 @@
 // a rate-limiter is both useless and rude. It errors on the first response.
 
 export const RETRY_ATTEMPTS = 2; // retries *after* the initial attempt
-const BASE_BACKOFF_MS = 500;
+
+// 500ms, then 1000ms. Overridable so the test suite can run the real retry
+// logic (attempt counts, predicates, give-up bound) without paying 1.5s of
+// wall-clock per retrying test — sleeping in a unit test buys nothing and
+// hides slow tests in the noise, which is exactly how a real network call went
+// unnoticed in this suite. Production behaviour is unchanged.
+const BASE_BACKOFF_MS = Number(process.env.LGTM_RETRY_BACKOFF_MS ?? 500);
 
 const TRANSIENT_PATTERNS: RegExp[] = [
   /\bi\/o timeout\b/i,

@@ -24,6 +24,15 @@ vi.mock("lighthouse", () => ({
   default: (url: string, opts: unknown) => lighthouseMock(url, opts),
 }));
 
+// lighthouse.ts probes the target before launching Chrome, to refuse auth-gated
+// / non-2xx responses (42L-973 #1/#2). Unmocked that is a REAL HTTP request to
+// example.com from the unit suite — the same class of leak that took CI red on
+// the ZAP tests. Injectable; default is "reachable and really the site".
+let probeResult: { ok: boolean; note?: string } = { ok: true };
+vi.mock("../../src/util/authgate.js", () => ({
+  probeTarget: async () => probeResult,
+}));
+
 const { lighthouseRunner } = await import("../../src/runners/lighthouse.js");
 
 let dir: string;

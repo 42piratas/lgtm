@@ -44,6 +44,27 @@ vi.mock("node:dns", () => ({
   },
 }));
 
+// zap.ts probes the target before spending a container run on it, to refuse
+// auth-gated / non-2xx responses (42L-973 #1/#2). Unmocked, that is a REAL
+// HTTP request from the unit suite — and it is precisely how this file went
+// red on CI while passing locally:
+//
+//   the two active-scan tests use http://localhost:3000. On the author's
+//   laptop an unrelated dev server happened to be listening there and returned
+//   200, so the probe succeeded and zap proceeded. On a CI runner nothing
+//   listens, the connection is refused, the probe burns its retry backoff
+//   (500ms + 1000ms — the tell-tale ~1.5s runtime), zapRunner returns early
+//   with status "error", dockerRun is never called, and the assertions blow up
+//   on an undefined mock call.
+//
+// A unit test must never depend on what is or isn't listening on the machine
+// running it. Probe result is injectable; default is the ordinary "target is
+// reachable and is really the site" case.
+let probeResult: { ok: boolean; note?: string } = { ok: true };
+vi.mock("../../src/util/authgate.js", () => ({
+  probeTarget: async () => probeResult,
+}));
+
 const { tlsRunner } = await import("../../src/runners/tls.js");
 const { depsRunner } = await import("../../src/runners/deps.js");
 const { secretsRunner } = await import("../../src/runners/secrets.js");
@@ -58,6 +79,7 @@ beforeEach(() => {
   hasDockerMock.mockReset();
   hasDockerMock.mockResolvedValue(true); // Docker is UP for every test here
   resolvedIps = ["93.184.216.34"]; // single-endpoint host unless a test says otherwise
+  probeResult = { ok: true }; // target reachable and really the site, unless a test says otherwise
   // tls/zap write their scanner output into a dir under process.cwd(); point
   // cwd at a temp dir so nothing is written into the repo.
   workRoot = mkdtempSync(join(tmpdir(), "lgtm-docker-parse-"));
@@ -558,5 +580,37 @@ describe("tlsRunner — endpoint pinning on multi-IP hosts (bug #7)", () => {
     ]);
     const r = await tlsRunner.run(ctx());
     expect(r.findings.filter((f) => f.id === "tls-BREACH")).toHaveLength(1);
+  });
+});
+
+// The behaviour that was silently untested until CI caught it: zap.ts probes
+// the target BEFORE spending a container run. Nothing exercised the refusal
+// path, so nothing noticed the probe was making a real network call.
+describe("zapRunner — refuses to scan a target that isn't the site", () => {
+  it("errors, and never starts a container, when the probe says the target is auth-gated", async () => {
+    probeResult = {
+      ok: false,
+      note: "refusing to score — redirected to a known auth gate (labs42.cloudflareaccess.com)",
+    };
+    dockerRunMock.mockResolvedValue(ok(""));
+
+    const r = await zapRunner.run(ctx({ baseUrl: "https://ds.example.com" }));
+
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/auth gate/);
+    expect(r.findings).toHaveLength(0);
+    // The point of probing first: don't burn a ZAP run on someone's login page.
+    expect(dockerRunMock).not.toHaveBeenCalled();
+  });
+
+  it("errors, and never starts a container, when the target returns a non-2xx status", async () => {
+    probeResult = { ok: false, note: "refusing to score — HTTP 429 — could not fetch the real page" };
+    dockerRunMock.mockResolvedValue(ok(""));
+
+    const r = await zapRunner.run(ctx());
+
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/429/);
+    expect(dockerRunMock).not.toHaveBeenCalled();
   });
 });

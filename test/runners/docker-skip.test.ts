@@ -14,6 +14,13 @@ vi.mock("../../src/util/docker.js", () => ({
   containerReachableUrl: (u: string) => u,
 }));
 
+// Belt and braces: zap.ts checks Docker before it probes the target, so this
+// file never reaches the network — but a future reordering must not silently
+// turn "runners skip when Docker is down" into a suite that needs the internet.
+vi.mock("../../src/util/authgate.js", () => ({
+  probeTarget: async () => ({ ok: true }),
+}));
+
 const { hasDocker } = await import("../../src/util/docker.js");
 const { tlsRunner } = await import("../../src/runners/tls.js");
 const { depsRunner } = await import("../../src/runners/deps.js");

@@ -39,7 +39,14 @@ export const zapRunner: Runner = {
     const start = Date.now();
     const findings: Finding[] = [];
 
-    // Refuse before spending a ZAP container run on content that isn't the
+    // Cheapest disqualifier first. If Docker isn't there we're skipping
+    // regardless of what the target says, so don't reach out over the network
+    // just to throw the answer away — a skip should cost nothing.
+    if (!(await hasDocker())) {
+      return skip(this, start, "docker unavailable (ZAP image needs it)");
+    }
+
+    // Then refuse before spending a ZAP container run on content that isn't the
     // site: an auth-gate redirect or a non-2xx/3xx response.
     const probe = await probeTarget(ctx.run.baseUrl);
     if (!probe.ok) {
@@ -51,10 +58,6 @@ export const zapRunner: Runner = {
         findings,
         durationMs: Date.now() - start,
       };
-    }
-
-    if (!(await hasDocker())) {
-      return skip(this, start, "docker unavailable (ZAP image needs it)");
     }
 
     const active = ctx.run.isLocalhost && ctx.run.allowActive;
