@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { promises as dns } from "node:dns";
 import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
 import { hasDocker, dockerRun } from "../util/docker.js";
 import { hostOf, isLocalhostUrl } from "../util/http.js";
@@ -17,6 +18,36 @@ const SEVERITY_MAP: Record<string, Finding["severity"]> = {
   LOW: "low",
   WARN: "low",
 };
+
+/**
+ * Which IP to hand testssl.sh, and how many the host actually has.
+ *
+ * Left to itself, testssl.sh loops the whole scan over EVERY resolved address
+ * and concatenates the results — which is what produced the duplicated TLS
+ * findings on ds.42labs.io and 42piratas.com (both Cloudflare-fronted, both
+ * two A-records). `--ip one` fixes the duplication but picks whichever address
+ * comes back first, so the scan is non-deterministic across CI machines and
+ * silently says nothing about how many endpoints exist.
+ *
+ * So we resolve the addresses ourselves and pin the lowest one in sorted
+ * order: same host, same IP, same result, on every machine. The count comes
+ * back too, so the runner can state its own coverage honestly rather than
+ * quietly implying it scanned everything.
+ */
+async function resolveScanTarget(
+  host: string,
+): Promise<{ ip: string | null; total: number }> {
+  try {
+    const [v4, v6] = await Promise.all([
+      dns.resolve4(host).catch(() => [] as string[]),
+      dns.resolve6(host).catch(() => [] as string[]),
+    ]);
+    const all = [...v4, ...v6].sort();
+    return { ip: all[0] ?? null, total: all.length };
+  } catch {
+    return { ip: null, total: 0 };
+  }
+}
 
 export const tlsRunner: Runner = {
   id: "tls",
@@ -36,6 +67,10 @@ export const tlsRunner: Runner = {
     }
 
     const host = hostOf(url);
+    // Pin a single, deterministic endpoint (see resolveScanTarget). Falling
+    // back to "one" keeps the runner working if DNS resolution fails here but
+    // works inside the container.
+    const { ip, total } = await resolveScanTarget(host);
     const work = join(process.cwd(), "reports", ".work", `tls-${ctx.run.stamp}`);
     mkdirSync(work, { recursive: true });
     try {
@@ -44,16 +79,14 @@ export const tlsRunner: Runner = {
         args: [
           "--quiet",
           "--fast",
-          // A hostname behind a CDN/anycast (Cloudflare, Vercel, ...) usually
-          // resolves to 2+ A records. Without --ip, testssl.sh loops the scan
-          // over every resolved IP and concatenates the results — the exact
-          // same check block appears twice (or partially twice) in the JSON
-          // for a dual-IP host (reproduced on ds.42labs.io and 42piratas.com,
-          // both Cloudflare-fronted, both resolving to 2 IPs). One IP is a
-          // representative, honest sample of the edge's TLS posture; scan it
-          // once.
+          // Scan exactly one endpoint, chosen deterministically. Without this,
+          // testssl.sh loops over every resolved address and concatenates the
+          // results — which is what emitted every TLS finding twice for
+          // ds.42labs.io and 42piratas.com (both Cloudflare, both dual-IP).
+          // The hostname is still passed as the target, so SNI/cert validation
+          // are done against the real name.
           "--ip",
-          "one",
+          ip ?? "one",
           "--severity",
           "LOW",
           "--jsonfile",
@@ -99,9 +132,10 @@ export const tlsRunner: Runner = {
         };
       }
 
-      // Defense in depth: even with --ip=one, collapse any (id, finding)
-      // pair testssl reports more than once rather than trust a single flag
-      // to be the only thing standing between us and a duplicated report.
+      // Defense in depth: even pinned to one endpoint, collapse any
+      // (id, finding) pair testssl reports more than once rather than trust a
+      // single flag to be the only thing standing between us and a duplicated
+      // report.
       const seen = new Set<string>();
       for (const item of parsed) {
         const sev = SEVERITY_MAP[item.severity?.toUpperCase?.() ?? ""];
@@ -126,12 +160,32 @@ export const tlsRunner: Runner = {
         });
       }
 
+      // Say out loud what was and wasn't covered. Scanning one endpoint of a
+      // multi-endpoint host is the right default (every edge of a CDN serves
+      // the same TLS config, and scanning all of them just duplicates the
+      // report) — but "we only looked at one of N" is a fact the operator is
+      // entitled to, not something to bury. If the endpoints ever genuinely
+      // diverge, this line is the thread to pull.
+      if (total > 1 && ip) {
+        findings.push({
+          id: "tls-endpoint-coverage",
+          title: `Scanned 1 of ${total} resolved endpoints for ${host} (${ip}) — a divergent endpoint would not be seen`,
+          severity: "info",
+          needsReview: true,
+          location: host,
+          remediation:
+            "Normal for a CDN/anycast host, where every edge serves the same TLS configuration. If this host fronts genuinely different origins per address, scan each address explicitly.",
+        });
+      }
+
       return {
         runnerId: this.id,
         domain: this.domain,
         status: "ok",
+        note: total > 1 ? `1 of ${total} endpoints (${ip})` : undefined,
         findings,
         durationMs: Date.now() - start,
+        meta: { endpointScanned: ip, endpointsResolved: total },
       };
     } finally {
       rmSync(work, { recursive: true, force: true });
