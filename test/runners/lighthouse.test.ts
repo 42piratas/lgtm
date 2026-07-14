@@ -288,36 +288,66 @@ describe("lighthouseRunner — an unmeasured page is never a passing page (42L-1
   // and produced nothing is a hard failure ("Audit did not produce a value at
   // all"). We match that. Refusing on every null category instead would
   // red-build healthy sites — which is how a gate gets switched off.
+  // Builds an LHR the way real Lighthouse emits one. Critically, it applies
+  // Lighthouse's OWN scoring rules (core/scoring.js) rather than letting the
+  // test invent a shape:
+  //   - notApplicable / informative / manual audits get weight 0
+  //   - arithmeticMean drops weight-0 items, THEN checks for null
+  //   - `sum / weight || 0` — so an all-not-applicable category scores 0, NOT null
+  // Getting this wrong is how a test ends up encoding the same wrong mental
+  // model as the code it is supposed to be guarding.
+  const ZERO_WEIGHT = new Set(["notApplicable", "informative", "manual"]);
+
   function withAudits(
-    cats: Record<string, { score: number | null; auditRefs: string[] }>,
-    audits: Record<string, { scoreDisplayMode: string; title: string }>,
+    cats: Record<string, string[]>,
+    audits: Record<string, { scoreDisplayMode: string; title: string; score: number | null }>,
   ) {
-    return {
-      lhr: {
-        audits,
-        categories: Object.fromEntries(
-          Object.entries(cats).map(([k, c]) => [
-            k,
-            { title: k, score: c.score, auditRefs: c.auditRefs.map((id) => ({ id })) },
-          ]),
-        ),
-      },
+    const audit = (id: string) => {
+      const a = audits[id];
+      if (!a) throw new Error(`test fixture: no audit "${id}"`);
+      return a;
     };
+    const categories = Object.fromEntries(
+      Object.entries(cats).map(([key, refIds]) => {
+        const refs = refIds.map((id) => ({
+          id,
+          weight: ZERO_WEIGHT.has(audit(id).scoreDisplayMode) ? 0 : 1,
+        }));
+        const weighted = refs.filter((r) => r.weight > 0);
+        let score: number | null;
+        if (weighted.some((r) => audit(r.id).score === null)) {
+          score = null; // a weighted null (an errored audit) nulls the category
+        } else {
+          const sum = weighted.reduce((a, r) => a + (audit(r.id).score as number) * r.weight, 0);
+          const w = weighted.reduce((a, r) => a + r.weight, 0);
+          score = sum / w || 0; // 0/0 → NaN → || 0 — the all-not-applicable case
+        }
+        return [key, { title: key, score, auditRefs: refs }];
+      }),
+    );
+    return { lhr: { audits, categories } };
   }
+
+  const OK_AUDITS = {
+    fcp: { scoreDisplayMode: "numeric", title: "First Contentful Paint", score: 0.95 },
+    viewport: { scoreDisplayMode: "binary", title: "Has a viewport meta tag", score: 0.95 },
+    "image-alt": {
+      scoreDisplayMode: "notApplicable",
+      title: "Images have alt text",
+      score: null,
+    },
+    "is-on-https": { scoreDisplayMode: "error", title: "Uses HTTPS", score: null },
+  };
 
   it("refuses when a category is unscored because an audit ERRORED", async () => {
     lighthouseMock.mockResolvedValue(
       withAudits(
         {
-          performance: { score: 0.95, auditRefs: ["fcp"] },
-          "best-practices": { score: null, auditRefs: ["is-on-https"] },
-          seo: { score: 0.95, auditRefs: ["viewport"] },
+          performance: ["fcp"],
+          "best-practices": ["is-on-https"], // errored, weight 1 → category null
+          seo: ["viewport"],
         },
-        {
-          fcp: { scoreDisplayMode: "numeric", title: "First Contentful Paint" },
-          "is-on-https": { scoreDisplayMode: "error", title: "Uses HTTPS" },
-          viewport: { scoreDisplayMode: "binary", title: "Has a viewport meta tag" },
-        },
+        OK_AUDITS,
       ),
     );
     const r = await lighthouseRunner.run(ctx());
@@ -327,28 +357,40 @@ describe("lighthouseRunner — an unmeasured page is never a passing page (42L-1
     expect(r.findings.map((f) => f.id)).not.toContain("lh-ok");
   });
 
-  it("does NOT refuse when a category is unscored only because audits were NOT APPLICABLE", async () => {
-    // The healthy-page false-FAIL this rule exists to avoid.
+  // The case the previous attempt got wrong. Real Lighthouse zeroes the weight of
+  // a notApplicable audit, so a category made entirely of them does NOT come back
+  // null — it comes back **0** (`0/0 || 0`). Scoring that 0 against the threshold
+  // reports a failing grade for a category that was never measured: the `?? 0`
+  // bug again, one layer down. It must be surfaced, never graded.
+  it("never grades the 0 that an all-not-applicable category comes back with", async () => {
     lighthouseMock.mockResolvedValue(
       withAudits(
         {
-          performance: { score: 0.95, auditRefs: ["fcp"] },
-          "best-practices": { score: null, auditRefs: ["image-alt"] },
-          seo: { score: 0.95, auditRefs: ["viewport"] },
+          performance: ["fcp"],
+          "best-practices": ["image-alt"], // notApplicable → weight 0 → score 0, not null
+          seo: ["viewport"],
         },
-        {
-          fcp: { scoreDisplayMode: "numeric", title: "First Contentful Paint" },
-          "image-alt": { scoreDisplayMode: "notApplicable", title: "Images have alt text" },
-          viewport: { scoreDisplayMode: "binary", title: "Has a viewport meta tag" },
-        },
+        OK_AUDITS,
       ),
     );
     const r = await lighthouseRunner.run(ctx());
+
+    // Sanity-check the fixture really reproduces Lighthouse's behaviour: an
+    // all-not-applicable category scores 0, not null. If this ever asserts null,
+    // the fixture — not the runner — is the thing that drifted.
+    const lhrCats = (await lighthouseMock.mock.results[0]?.value).lhr.categories as Record<
+      string,
+      { score: number | null }
+    >;
+    expect(lhrCats["best-practices"]?.score).toBe(0);
+
     expect(r.status).toBe("ok");
-    // …but it must never be reported as a pass for that category. It is surfaced,
-    // visibly, as "no verdict" — never scored, never hidden.
-    const na = r.findings.find((f) => f.id === "lh-best-practices-not-measured");
-    expect(na?.needsReview).toBe(true);
+    // The 0 must NOT have become a threshold failure.
+    expect(r.findings.map((f) => f.id)).not.toContain("lh-best-practices");
+    // It must be visible as "no verdict", not silently dropped.
+    expect(
+      r.findings.find((f) => f.id === "lh-best-practices-not-measured")?.needsReview,
+    ).toBe(true);
     expect(r.findings.map((f) => f.id)).not.toContain("lh-ok");
     expect((r.meta as { scores: Record<string, number> }).scores).not.toHaveProperty(
       "best-practices",
@@ -359,16 +401,38 @@ describe("lighthouseRunner — an unmeasured page is never a passing page (42L-1
     lighthouseMock.mockResolvedValue(
       withAudits(
         {
-          performance: { score: null, auditRefs: ["image-alt"] },
-          "best-practices": { score: null, auditRefs: ["image-alt"] },
-          seo: { score: null, auditRefs: ["image-alt"] },
+          performance: ["image-alt"],
+          "best-practices": ["image-alt"],
+          seo: ["image-alt"],
         },
-        { "image-alt": { scoreDisplayMode: "notApplicable", title: "Images have alt text" } },
+        OK_AUDITS,
       ),
     );
     const r = await lighthouseRunner.run(ctx());
     expect(r.status).toBe("error");
     expect(r.note).toMatch(/never measured/i);
+  });
+
+  it("does not refuse for an errored audit that carries no weight", async () => {
+    // A zero-weight errored audit doesn't null the category and doesn't affect
+    // the score — failing the whole run on it would be crying wolf.
+    lighthouseMock.mockResolvedValue({
+      lhr: {
+        audits: OK_AUDITS,
+        categories: {
+          performance: {
+            title: "performance",
+            score: 0.95,
+            auditRefs: [
+              { id: "fcp", weight: 1 },
+              { id: "is-on-https", weight: 0 },
+            ],
+          },
+        },
+      },
+    });
+    const r = await lighthouseRunner.run(ctx());
+    expect(r.status).toBe("ok");
   });
 
   it("scores normally when all three categories came back measured", async () => {

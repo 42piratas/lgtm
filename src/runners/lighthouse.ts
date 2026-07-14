@@ -126,77 +126,105 @@ export const lighthouseRunner: Runner = {
         };
       }
 
-      // A category's score is null the moment ANY audit inside it is unscored —
-      // Lighthouse's arithmeticMean returns null if a single item is null. So a
-      // null category does NOT mean "the page wasn't measured"; it can equally
-      // mean "one audit legitimately did not apply to this page" (no images →
-      // no image-alt check). Refusing on every null category would red-build
-      // healthy sites, which is how a gate ends up switched off.
+      // Whether a category score can be trusted is decided by the AUDITS inside
+      // it, never by the category number alone. From lighthouse/core/scoring.js:
       //
-      // Lighthouse CI — Google's own build gate — draws the line where it
-      // belongs: a `notApplicable` audit counts as a PASS, while an audit that
-      // ran and produced nothing is a hard failure ("Audit did not produce a
-      // value at all"). We do the same: look at WHY the category is unscored.
-      // Errored audits mean the page was not measured → refuse. Merely
-      // not-applicable ones are not a defect → score what was measured.
-      const audits = (lhr as { audits?: Record<string, { scoreDisplayMode?: string; title?: string }> })
-        .audits ?? {};
-      const erroredIn = (cat: { auditRefs?: Array<{ id: string }> }): string[] =>
-        (cat.auditRefs ?? [])
-          .filter((ref) => audits[ref.id]?.scoreDisplayMode === "error")
-          .map((ref) => audits[ref.id]?.title ?? ref.id);
-
-      const unmeasured = Object.entries(lhr.categories)
-        .map(([key, cat]) => ({ key, errored: erroredIn(cat as { auditRefs?: Array<{ id: string }> }) }))
-        .filter((c) => c.errored.length > 0);
-      if (unmeasured.length > 0) {
-        return {
-          runnerId: this.id,
-          domain: this.domain,
-          status: "error",
-          findings: [],
-          note: `Lighthouse audits errored, so ${unmeasured.map((c) => c.key).join(", ")} could not be measured — the scores are unknown, not passing: ${unmeasured.flatMap((c) => c.errored).slice(0, 3).join("; ")}`,
-          durationMs: Date.now() - start,
-        };
-      }
+      //   • scoreAllCategories() forces weight = 0 for every audit whose
+      //     scoreDisplayMode is notApplicable / informative / manual.
+      //   • arithmeticMean() drops all weight-0 items BEFORE its null check,
+      //     then returns `sum / weight || 0`.
+      //
+      // Two consequences the obvious reading gets backwards:
+      //   1. A category only goes `score: null` because a WEIGHTED audit was
+      //      unscored — i.e. one that errored. Null means "not measured".
+      //   2. A category whose every weighted audit is not-applicable does NOT
+      //      come back null. It comes back **0** — `0/0 || 0`. Scoring that 0
+      //      against the threshold would report a failing performance grade for
+      //      a page that was never measured: the same lie as `?? 0`, wearing a
+      //      different hat.
+      //
+      // So we split by cause, the way Lighthouse CI (Google's own build gate)
+      // does: an audit that ran and produced nothing is a hard failure ("Audit
+      // did not produce a value at all"); a not-applicable audit is not a defect.
+      const audits =
+        (lhr as { audits?: Record<string, { scoreDisplayMode?: string; title?: string }> })
+          .audits ?? {};
+      type Ref = { id: string; weight?: number };
+      const refsOf = (cat: unknown): Ref[] =>
+        ((cat as { auditRefs?: Ref[] }).auditRefs ?? []).map((r) => ({
+          id: r.id,
+          weight: r.weight ?? 1,
+        }));
 
       const scores: Record<string, number> = {};
-      const notApplicable: string[] = [];
-      {
-        for (const [key, cat] of Object.entries(lhr.categories)) {
-          // Unscored, but nothing errored: every contributing audit was
-          // not-applicable to this page. That is not a failure and it is not a
-          // zero — it is "no verdict". Record it, score it never, hide it never.
-          if (cat.score === null || cat.score === undefined) {
-            notApplicable.push(key);
-            findings.push({
-              id: `lh-${key}-not-measured`,
-              title: `Lighthouse returned no ${cat.title} score — no applicable audits for this page`,
-              severity: "info",
-              needsReview: true,
-              location: url,
-              remediation: `Confirm ${cat.title} is genuinely not applicable here; if it should have scored, the audit inputs are missing.`,
-            });
-            continue;
-          }
-          const score = cat.score;
-          scores[key] = score;
-          const threshold = THRESHOLDS[key];
-          if (threshold !== undefined && score < threshold) {
-            findings.push({
-              id: `lh-${key}`,
-              title: `Lighthouse ${cat.title} score ${(score * 100).toFixed(0)} < ${(threshold * 100).toFixed(0)}`,
-              severity: SEVERITY_BY_SCORE(score),
-              standard: "Lighthouse / Core Web Vitals",
-              location: url,
-              remediation: `Open the full Lighthouse report for ${cat.title} opportunities.`,
-            });
-          }
+      const notMeasured: string[] = [];
+
+      for (const [key, cat] of Object.entries(lhr.categories)) {
+        const refs = refsOf(cat);
+
+        // An errored audit that actually carries weight is what nulls a category.
+        // A zero-weight one doesn't affect the score, so it must not fail the run.
+        const errored = refs.filter(
+          (r) => (r.weight ?? 1) > 0 && audits[r.id]?.scoreDisplayMode === "error",
+        );
+        if (errored.length > 0) {
+          return {
+            runnerId: this.id,
+            domain: this.domain,
+            status: "error",
+            findings: [],
+            note: `Lighthouse audits errored, so ${key} could not be measured — the scores are unknown, not passing: ${errored
+              .map((r) => audits[r.id]?.title ?? r.id)
+              .slice(0, 3)
+              .join("; ")}`,
+            durationMs: Date.now() - start,
+          };
+        }
+
+        // Every contributing audit was not-applicable → Lighthouse hands back 0,
+        // and that 0 is not a score. Never grade it; surface it for a human.
+        const weighted = refs.filter((r) => (r.weight ?? 1) > 0);
+        if (refs.length > 0 && weighted.length === 0) {
+          notMeasured.push(key);
+          findings.push({
+            id: `lh-${key}-not-measured`,
+            title: `Lighthouse produced no ${cat.title} score — every audit in it was not applicable to this page`,
+            severity: "info",
+            needsReview: true,
+            location: url,
+            remediation: `Confirm ${cat.title} is genuinely not applicable here; if it should have scored, the audit inputs are missing.`,
+          });
+          continue;
+        }
+
+        // Null with nothing errored to explain it: unknown, and unknown is not clean.
+        if (cat.score === null || cat.score === undefined) {
+          return {
+            runnerId: this.id,
+            domain: this.domain,
+            status: "error",
+            findings: [],
+            note: `Lighthouse returned no ${key} score — the category was not measured, so the score is unknown, not passing.`,
+            durationMs: Date.now() - start,
+          };
+        }
+
+        const score = cat.score;
+        scores[key] = score;
+        const threshold = THRESHOLDS[key];
+        if (threshold !== undefined && score < threshold) {
+          findings.push({
+            id: `lh-${key}`,
+            title: `Lighthouse ${cat.title} score ${(score * 100).toFixed(0)} < ${(threshold * 100).toFixed(0)}`,
+            severity: SEVERITY_BY_SCORE(score),
+            standard: "Lighthouse / Core Web Vitals",
+            location: url,
+            remediation: `Open the full Lighthouse report for ${cat.title} opportunities.`,
+          });
         }
       }
 
-      // Nothing errored, but nothing scored either — every category came back
-      // not-applicable. That is not a clean page, it is an unmeasured one.
+      // Nothing errored, but nothing scored either — the page was never measured.
       if (Object.keys(scores).length === 0) {
         return {
           runnerId: this.id,
@@ -220,12 +248,12 @@ export const lighthouseRunner: Runner = {
         runnerId: this.id,
         domain: this.domain,
         status: "ok",
-        note: notApplicable.length
-          ? `not scored (no applicable audits): ${notApplicable.join(", ")}`
+        note: notMeasured.length
+          ? `not scored (no applicable audits): ${notMeasured.join(", ")}`
           : undefined,
         findings,
         durationMs: Date.now() - start,
-        meta: { scores, notApplicable },
+        meta: { scores, notMeasured },
       };
     } catch (err) {
       return {
