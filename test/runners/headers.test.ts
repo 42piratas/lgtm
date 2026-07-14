@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { derive } from "../../src/scoring.js";
 import type { RunnerContext, SiteConfig } from "../../src/types.js";
 import type { FetchedResponse } from "../../src/util/http.js";
 
@@ -61,13 +62,13 @@ beforeEach(() => {
 });
 
 describe("headersRunner — strong config passes clean", () => {
-  it("reports a single info finding when every header is present and strong", async () => {
+  it("is clean, with the response and check count on record, when every header is present and strong", async () => {
     vi.mocked(fetchUrl).mockResolvedValue(response({ headers: STRONG_HEADERS }));
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     expect(result.status).toBe("ok");
-    expect(result.findings).toEqual([
-      expect.objectContaining({ id: "headers-ok", severity: "info" }),
-    ]);
+    expect(result.findings).toEqual([]);
+    expect(result.coverage?.data.responded).toBe(true);
+    expect(Number(result.coverage?.data.checksEvaluated)).toBeGreaterThan(0);
   });
 });
 
@@ -76,7 +77,7 @@ describe("headersRunner — CSP", () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({ headers: { ...STRONG_HEADERS, "content-security-policy": "default-src 'self'; script-src 'unsafe-inline'" } }),
     );
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     const csp = result.findings.find((f) => f.id === "csp")!;
     expect(csp.severity).toBe("high");
     expect(csp.title).toMatch(/unsafe-inline/);
@@ -86,7 +87,7 @@ describe("headersRunner — CSP", () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({ headers: { ...STRONG_HEADERS, "content-security-policy": "default-src 'self'; script-src 'unsafe-eval'" } }),
     );
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     expect(result.findings.find((f) => f.id === "csp")!.title).toMatch(/unsafe-eval/);
   });
 
@@ -94,7 +95,7 @@ describe("headersRunner — CSP", () => {
     const headers = { ...STRONG_HEADERS };
     delete (headers as Record<string, string>)["content-security-policy"];
     vi.mocked(fetchUrl).mockResolvedValue(response({ headers }));
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     const csp = result.findings.find((f) => f.id === "csp")!;
     expect(csp.severity).toBe("high");
     expect(csp.title).toMatch(/no Content-Security-Policy/);
@@ -104,7 +105,7 @@ describe("headersRunner — CSP", () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({ headers: { ...STRONG_HEADERS, "content-security-policy": "default-src 'self'; script-src *" } }),
     );
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     expect(result.findings.find((f) => f.id === "csp")!.title).toMatch(/wildcard/);
   });
 });
@@ -114,7 +115,7 @@ describe("headersRunner — HSTS", () => {
     const headers = { ...STRONG_HEADERS };
     delete (headers as Record<string, string>)["strict-transport-security"];
     vi.mocked(fetchUrl).mockResolvedValue(response({ headers }));
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     const hsts = result.findings.find((f) => f.id === "hsts")!;
     expect(hsts.severity).toBe("high");
     expect(hsts.title).toMatch(/no Strict-Transport-Security/);
@@ -127,7 +128,7 @@ describe("headersRunner — HSTS", () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({ headers: { ...STRONG_HEADERS, "strict-transport-security": "max-age=31535999" } }),
     );
-    const justUnder = await headersRunner.run(ctx("https://example.com"));
+    const justUnder = await derive(headersRunner, ctx("https://example.com"));
     expect(justUnder.findings.find((f) => f.id === "hsts")!.title).toMatch(
       /max-age 31535999 < 1 year/,
     );
@@ -135,7 +136,7 @@ describe("headersRunner — HSTS", () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({ headers: { ...STRONG_HEADERS, "strict-transport-security": "max-age=31536000" } }),
     );
-    const exactlyAt = await headersRunner.run(ctx("https://example.com"));
+    const exactlyAt = await derive(headersRunner, ctx("https://example.com"));
     expect(exactlyAt.findings.find((f) => f.id === "hsts")).toBeUndefined();
   });
 
@@ -143,7 +144,7 @@ describe("headersRunner — HSTS", () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({ headers: { ...STRONG_HEADERS, "strict-transport-security": "includeSubDomains" } }),
     );
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     expect(result.findings.find((f) => f.id === "hsts")!.title).toMatch(/no max-age directive/);
   });
 
@@ -151,7 +152,7 @@ describe("headersRunner — HSTS", () => {
     const headers = { ...STRONG_HEADERS };
     delete (headers as Record<string, string>)["strict-transport-security"];
     vi.mocked(fetchUrl).mockResolvedValue(response({ url: "http://example.com", finalUrl: "http://example.com", headers }));
-    const result = await headersRunner.run(ctx("http://example.com"));
+    const result = await derive(headersRunner, ctx("http://example.com"));
     expect(result.findings.find((f) => f.id === "hsts")).toBeUndefined();
   });
 });
@@ -161,7 +162,7 @@ describe("headersRunner — X-Frame-Options / frame-ancestors", () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({ headers: { ...STRONG_HEADERS, "x-frame-options": "ALLOW-FROM https://evil.example" } }),
     );
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     expect(result.findings.find((f) => f.id === "x-frame-options")!.title).toMatch(/weak value/);
   });
 
@@ -169,7 +170,7 @@ describe("headersRunner — X-Frame-Options / frame-ancestors", () => {
     const headers = { ...STRONG_HEADERS, "content-security-policy": "default-src 'self'; frame-ancestors 'none'" };
     delete (headers as Record<string, string>)["x-frame-options"];
     vi.mocked(fetchUrl).mockResolvedValue(response({ headers }));
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     expect(result.findings.find((f) => f.id === "x-frame-options")).toBeUndefined();
   });
 });
@@ -184,7 +185,7 @@ describe("headersRunner — x-content-type-options", () => {
     const headers = { ...STRONG_HEADERS };
     delete (headers as Record<string, string>)["x-content-type-options"];
     vi.mocked(fetchUrl).mockResolvedValue(response({ headers }));
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     const f = result.findings.find((x) => x.id === "x-content-type-options")!;
     expect(f).toBeDefined();
     expect(f.severity).toBe("medium");
@@ -195,7 +196,7 @@ describe("headersRunner — x-content-type-options", () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({ headers: { ...STRONG_HEADERS, "x-content-type-options": "sniff" } }),
     );
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     const f = result.findings.find((x) => x.id === "x-content-type-options")!;
     expect(f).toBeDefined();
     expect(f.severity).toBe("medium");
@@ -205,7 +206,7 @@ describe("headersRunner — x-content-type-options", () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({ headers: { ...STRONG_HEADERS, "x-content-type-options": "nosniff" } }),
     );
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     expect(result.findings.find((x) => x.id === "x-content-type-options")).toBeUndefined();
   });
 });
@@ -215,7 +216,7 @@ describe("headersRunner — referrer-policy", () => {
     const headers = { ...STRONG_HEADERS };
     delete (headers as Record<string, string>)["referrer-policy"];
     vi.mocked(fetchUrl).mockResolvedValue(response({ headers }));
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     const f = result.findings.find((x) => x.id === "referrer-policy")!;
     expect(f).toBeDefined();
     expect(f.severity).toBe("low");
@@ -226,7 +227,7 @@ describe("headersRunner — referrer-policy", () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({ headers: { ...STRONG_HEADERS, "referrer-policy": "no-referrer" } }),
     );
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     expect(result.findings.find((x) => x.id === "referrer-policy")).toBeUndefined();
   });
 });
@@ -236,7 +237,7 @@ describe("headersRunner — permissions-policy", () => {
     const headers = { ...STRONG_HEADERS };
     delete (headers as Record<string, string>)["permissions-policy"];
     vi.mocked(fetchUrl).mockResolvedValue(response({ headers }));
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     const f = result.findings.find((x) => x.id === "permissions-policy")!;
     expect(f).toBeDefined();
     expect(f.severity).toBe("low");
@@ -247,7 +248,7 @@ describe("headersRunner — permissions-policy", () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({ headers: { ...STRONG_HEADERS, "permissions-policy": "camera=()" } }),
     );
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     expect(result.findings.find((x) => x.id === "permissions-policy")).toBeUndefined();
   });
 });
@@ -257,7 +258,7 @@ describe("headersRunner — cross-origin-opener-policy", () => {
     const headers = { ...STRONG_HEADERS };
     delete (headers as Record<string, string>)["cross-origin-opener-policy"];
     vi.mocked(fetchUrl).mockResolvedValue(response({ headers }));
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     const f = result.findings.find((x) => x.id === "coop")!;
     expect(f).toBeDefined();
     expect(f.severity).toBe("low");
@@ -268,7 +269,7 @@ describe("headersRunner — cross-origin-opener-policy", () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({ headers: { ...STRONG_HEADERS, "cross-origin-opener-policy": "unsafe-none" } }),
     );
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     const f = result.findings.find((x) => x.id === "coop")!;
     expect(f).toBeDefined();
     expect(f.severity).toBe("low");
@@ -278,7 +279,7 @@ describe("headersRunner — cross-origin-opener-policy", () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({ headers: { ...STRONG_HEADERS, "cross-origin-opener-policy": "same-origin" } }),
     );
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     expect(result.findings.find((x) => x.id === "coop")).toBeUndefined();
   });
 });
@@ -294,7 +295,7 @@ describe("headersRunner — information leakage", () => {
     vi.mocked(fetchUrl).mockResolvedValue(
       response({ headers: { ...STRONG_HEADERS, [header]: value } }),
     );
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     const leak = result.findings.find((f) => f.id === `leak-${header}`)!;
     expect(leak).toBeDefined();
     expect(leak.severity).toBe("low");
@@ -307,7 +308,7 @@ describe("headersRunner — information leakage", () => {
         headers: { ...STRONG_HEADERS, server: "nginx", "x-powered-by": "Express" },
       }),
     );
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     expect(result.findings.filter((f) => f.id.startsWith("leak-"))).toHaveLength(2);
   });
 });
@@ -315,14 +316,14 @@ describe("headersRunner — information leakage", () => {
 describe("headersRunner — plaintext transport", () => {
   it("flags http:// on a non-local target as its own high finding", async () => {
     vi.mocked(fetchUrl).mockResolvedValue(response({ url: "http://example.com", finalUrl: "http://example.com", headers: {} }));
-    const result = await headersRunner.run(ctx("http://example.com"));
+    const result = await derive(headersRunner, ctx("http://example.com"));
     const noTls = result.findings.find((f) => f.id === "no-tls")!;
     expect(noTls.severity).toBe("high");
   });
 
   it("does not flag http:// on localhost", async () => {
     vi.mocked(fetchUrl).mockResolvedValue(response({ url: "http://localhost:3000", finalUrl: "http://localhost:3000", headers: {} }));
-    const result = await headersRunner.run(ctx("http://localhost:3000"));
+    const result = await derive(headersRunner, ctx("http://localhost:3000"));
     expect(result.findings.find((f) => f.id === "no-tls")).toBeUndefined();
   });
 });
@@ -330,7 +331,7 @@ describe("headersRunner — plaintext transport", () => {
 describe("headersRunner — fetch failure", () => {
   it("reports status: error rather than throwing when the fetch itself fails", async () => {
     vi.mocked(fetchUrl).mockRejectedValue(new Error("ECONNREFUSED"));
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     expect(result.status).toBe("error");
     expect(result.note).toMatch(/ECONNREFUSED/);
     expect(result.findings).toEqual([]);
@@ -351,7 +352,7 @@ describe("headersRunner — regression guards for known field bugs (42L-973)", (
   // having none, on a site that in a browser returns 200 with all 8.
   it("refuses to score (status error), rather than reporting missing headers, when the response is a 429", async () => {
     vi.mocked(fetchUrl).mockResolvedValue(response({ status: 429, headers: {} }));
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
 
     expect(result.status).toBe("error");
     expect(result.note).toMatch(/429/);
@@ -364,7 +365,7 @@ describe("headersRunner — regression guards for known field bugs (42L-973)", (
 
   it("refuses to score a 503 the same way — any non-2xx/3xx is 'unknown', not 'clean'", async () => {
     vi.mocked(fetchUrl).mockResolvedValue(response({ status: 503, headers: {} }));
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
     expect(result.status).toBe("error");
     expect(result.note).toMatch(/503/);
     expect(result.findings).toHaveLength(0);
@@ -382,7 +383,7 @@ describe("headersRunner — regression guards for known field bugs (42L-973)", (
         headers: STRONG_HEADERS,
       }),
     );
-    const result = await headersRunner.run(ctx("https://app.example.com/dashboard"));
+    const result = await derive(headersRunner, ctx("https://app.example.com/dashboard"));
 
     expect(result.status).toBe("error");
     expect(result.note).toMatch(/auth gate/i);
@@ -403,7 +404,7 @@ describe("headersRunner — regression guards for known field bugs (42L-973)", (
         headers: STRONG_HEADERS,
       }),
     );
-    const result = await headersRunner.run(ctx("https://example.com"));
+    const result = await derive(headersRunner, ctx("https://example.com"));
 
     expect(result.status).toBe("ok");
     expect(result.note).toBeUndefined();

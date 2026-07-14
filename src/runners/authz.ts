@@ -1,6 +1,12 @@
 import { chromium } from "playwright";
 import { existsSync } from "node:fs";
-import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
+import type {
+  Coverage,
+  Finding,
+  Runner,
+  RunnerContext,
+  RunnerOutcome,
+} from "../types.js";
 
 // Authenticated-access checks. Drives two browser contexts — one carrying the
 // operator's session (storageState), one anonymous — and compares:
@@ -16,41 +22,56 @@ export const authzRunner: Runner = {
   domain: "authz",
   title: "Authenticated access & session hygiene",
   requires: { target: true, browser: true },
-  async run(ctx: RunnerContext): Promise<RunnerResult> {
-    const start = Date.now();
+
+  /**
+   * "Protected routes enforce auth" is a claim about routes. Probe none, and
+   * there is no claim to make — the old runner said it anyway, on a site with
+   * no routes configured. And a route whose probe never landed tells us nothing
+   * about whether it is reachable anonymously, which is the one thing this
+   * runner exists to find out.
+   */
+  sufficient(cov: Coverage): string | null {
+    const configured = Number(cov.data.routesConfigured ?? 0);
+    const probed = Number(cov.data.routesProbed ?? 0);
+    const failed = Number(cov.data.probesFailed ?? 0);
+    // Order matters: a route that was configured but never loaded must be
+    // reported as unverified, not as "you configured no routes" — the operator
+    // would go looking in the wrong place.
+    if (failed > 0) {
+      return `${failed} probe${failed === 1 ? "" : "s"} never landed — ${configured - probed} route${configured - probed === 1 ? "" : "s"} not verified`;
+    }
+    if (configured === 0) {
+      return "no protected routes are configured — add app routes to the site config to exercise access control";
+    }
+    if (probed === 0) {
+      return "no protected route was successfully probed";
+    }
+    return null;
+  },
+
+  async observe(ctx: RunnerContext): Promise<RunnerOutcome> {
     const findings: Finding[] = [];
 
     if (ctx.site.auth.type !== "storageState") {
+      // The operator declared this site has no authenticated surface. There is
+      // no access control to audit — nothing was missed.
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "skipped",
+        kind: "notApplicable",
         note: "no authenticated session configured for this site",
-        findings,
-        durationMs: Date.now() - start,
       };
     }
     if (!existsSync(ctx.site.auth.path)) {
+      // The site DOES have an authenticated surface; we just have no session to
+      // reach it with. That surface went unaudited — a hole, not a non-issue.
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "skipped",
-        note: "auth storageState file missing — run `lgtm auth` to capture one",
-        findings,
-        durationMs: Date.now() - start,
+        kind: "unavailable",
+        note: "auth storageState file missing — run `lgtm auth` to capture one; the authenticated surface was not audited",
       };
     }
 
     // Routes beyond the base URL are the candidate protected surfaces.
     const protectedUrls = ctx.urls.filter((u) => u !== ctx.run.baseUrl);
-    if (protectedUrls.length === 0) {
-      findings.push({
-        id: "authz-no-routes",
-        title:
-          "No protected routes configured — add app routes to the site config to exercise access control",
-        severity: "info",
-      });
-    }
+    const trail: string[] = [];
 
     const browser = await chromium.launch({ headless: true });
     try {
@@ -72,6 +93,11 @@ export const authzRunner: Runner = {
       // exists to kill. Unchecked is not "safe": it is unknown, and unknown
       // fails the run.
       const navFailures: Array<{ url: string; phase: string; message: string }> = [];
+      // A route only counts as probed when BOTH views landed: the anonymous
+      // probe is what detects a missing guard, the authed one is what proves the
+      // route exists behind the session. One without the other is half a check.
+      const landedAuthed = new Set<string>();
+      const landedAnon = new Set<string>();
 
       for (const url of protectedUrls) {
         // (1)+(3): authed view.
@@ -103,6 +129,7 @@ export const authzRunner: Runner = {
                 "Send Cache-Control: no-store on authenticated responses to prevent shared-cache leakage.",
             });
           }
+          landedAuthed.add(url);
         } catch (err) {
           navFailures.push({
             url,
@@ -132,6 +159,10 @@ export const authzRunner: Runner = {
                 "Enforce authentication server-side on this route; do not rely on client-side gating.",
             });
           }
+          landedAnon.add(url);
+          trail.push(
+            `probed ${url} anonymously — HTTP ${status}${blocked ? " (blocked)" : " (reachable)"}`,
+          );
         } catch (err) {
           // This is the load-bearing one: the anonymous probe is what detects
           // broken access control. If it never landed, we know NOTHING about
@@ -157,59 +188,45 @@ export const authzRunner: Runner = {
       }
 
       // Every unchecked route gets its own visible finding — never silently
-      // dropped — and the runner errors, so the run cannot pass on a partial
-      // access-control audit. Any genuinely-open route found before the failure
-      // is still reported alongside it; a nav failure removes certainty, it
-      // doesn't erase evidence.
-      if (navFailures.length > 0) {
-        for (const f of navFailures) {
-          findings.push({
-            id: `authz-unchecked-${f.phase}-${f.url}`,
-            title: `Access control NOT verified for ${f.url} — the ${f.phase} probe failed to load it (${f.message.slice(0, 120)})`,
-            severity: "info",
-            needsReview: true,
-            standard: "OWASP Top 10 A01 (Broken Access Control) — unverified",
-            location: f.url,
-            remediation:
-              "This route was never actually checked: the result is unknown, not safe. Re-run once the target is reachable (a timeout/reset here is often a WAF rate-limiting the scanner).",
-          });
-        }
-        const routes = [...new Set(navFailures.map((f) => f.url))];
-        return {
-          runnerId: this.id,
-          domain: this.domain,
-          status: "error",
-          note: `could not verify access control on ${routes.length} of ${protectedUrls.length} protected route(s): ${routes.join(", ")} — findings unknown, not absent`,
-          findings,
-          durationMs: Date.now() - start,
-          meta: { protectedRoutes: protectedUrls.length, sessionWorks, unchecked: routes.length },
-        };
+      // dropped. Any genuinely-open route found before the failure is still
+      // reported alongside it: a nav failure removes certainty, it doesn't
+      // erase evidence. The coverage numbers below are what stop the run
+      // passing on a half-finished access-control audit.
+      for (const f of navFailures) {
+        findings.push({
+          id: `authz-unchecked-${f.phase}-${f.url}`,
+          title: `Access control NOT verified for ${f.url} — the ${f.phase} probe failed to load it (${f.message.slice(0, 120)})`,
+          severity: "info",
+          needsReview: true,
+          standard: "OWASP Top 10 A01 (Broken Access Control) — unverified",
+          location: f.url,
+          remediation:
+            "This route was never actually checked: the result is unknown, not safe. Re-run once the target is reachable (a timeout/reset here is often a WAF rate-limiting the scanner).",
+        });
+        trail.push(`FAILED ${f.phase} probe of ${f.url}`);
       }
 
-      if (findings.filter((f) => f.severity !== "info").length === 0) {
-        findings.push({
-          id: "authz-ok",
-          title: "Protected routes enforce auth; authed responses are non-cacheable",
-          severity: "info",
-        });
-      }
+      const routesProbed = [...landedAnon].filter((u) => landedAuthed.has(u)).length;
 
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "ok",
+        kind: "observed",
         findings,
-        durationMs: Date.now() - start,
+        coverage: {
+          trail,
+          data: {
+            routesConfigured: protectedUrls.length,
+            routesProbed,
+            probesFailed: navFailures.length,
+            sessionWorks,
+          },
+          provenance: "authenticated + anonymous navigation of each configured route",
+        },
         meta: { protectedRoutes: protectedUrls.length, sessionWorks },
       };
     } catch (err) {
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
+        kind: "failed",
         note: `browser session failed: ${(err as Error).message}`,
-        findings,
-        durationMs: Date.now() - start,
       };
     } finally {
       await browser.close().catch(() => {});

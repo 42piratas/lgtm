@@ -1,5 +1,11 @@
-import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
-import { hasDocker, dockerRun } from "../util/docker.js";
+import type {
+  Coverage,
+  Finding,
+  Runner,
+  RunnerContext,
+  RunnerOutcome,
+} from "../types.js";
+import { dockerRun } from "../util/docker.js";
 
 // Static analysis via Semgrep (container) using curated security rulesets.
 // White-box: needs the repo checkout. Ruleset fetch needs network.
@@ -21,6 +27,8 @@ interface SemgrepOutput {
     extra?: { severity?: string; message?: string; metadata?: { cwe?: string[] } };
   }>;
   errors?: Array<{ message?: string }>;
+  /** Semgrep's own record of what it read. `scanned` is the file list. */
+  paths?: { scanned?: string[] };
 }
 
 export const sastRunner: Runner = {
@@ -28,14 +36,23 @@ export const sastRunner: Runner = {
   domain: "sast",
   title: "Static analysis (Semgrep)",
   requires: { repo: true, docker: true },
-  async run(ctx: RunnerContext): Promise<RunnerResult> {
-    const start = Date.now();
+
+  /**
+   * Semgrep reports `results: []` whether it found nothing wrong or read
+   * nothing at all — point it at a repo whose languages none of the rulesets
+   * cover and it scans zero files, exits 0, and looks spotless. `paths.scanned`
+   * is the file list it actually opened, and an empty one is not a pass.
+   */
+  sufficient(cov: Coverage): string | null {
+    if (Number(cov.data.filesScanned ?? 0) === 0) {
+      return "semgrep scanned 0 files — no source the rulesets understand was found";
+    }
+    return null;
+  },
+
+  async observe(ctx: RunnerContext): Promise<RunnerOutcome> {
     const findings: Finding[] = [];
     const repo = ctx.site.repoPath!;
-
-    if (!(await hasDocker())) {
-      return skip(this, start, "docker unavailable (semgrep image needs it)");
-    }
 
     const configArgs = CONFIGS.flatMap((c) => ["--config", c]);
     const r = await dockerRun({
@@ -55,12 +72,8 @@ export const sastRunner: Runner = {
     const s = r.stdout.indexOf("{");
     if (s < 0) {
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
+        kind: "failed",
         note: `semgrep produced no parseable output (exit ${r.code}): ${(r.stderr || r.stdout).slice(0, 300)}`,
-        findings,
-        durationMs: Date.now() - start,
       };
     }
     let out: SemgrepOutput;
@@ -68,12 +81,8 @@ export const sastRunner: Runner = {
       out = JSON.parse(r.stdout.slice(s));
     } catch (err) {
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
+        kind: "failed",
         note: `semgrep produced unparseable JSON: ${(err as Error).message}`,
-        findings,
-        durationMs: Date.now() - start,
       };
     }
 
@@ -96,32 +105,20 @@ export const sastRunner: Runner = {
       });
     }
 
-    if (findings.length === 0) {
-      findings.push({
-        id: "sast-ok",
-        title: "No Semgrep findings across security rulesets",
-        severity: "info",
-      });
-    }
+    const scanned = out.paths?.scanned ?? [];
 
     return {
-      runnerId: this.id,
-      domain: this.domain,
-      status: "ok",
+      kind: "observed",
       note: out.errors?.length ? `${out.errors.length} scan error(s)` : undefined,
       findings,
-      durationMs: Date.now() - start,
+      coverage: {
+        trail: [
+          `scanned ${scanned.length} file${scanned.length === 1 ? "" : "s"} against ${CONFIGS.length} rulesets (${CONFIGS.join(", ")})`,
+        ],
+        data: { filesScanned: scanned.length, rulesets: CONFIGS.length },
+        provenance: "semgrep --json paths.scanned",
+      },
+      meta: { filesScanned: scanned.length },
     };
   },
 };
-
-function skip(r: Runner, start: number, note: string): RunnerResult {
-  return {
-    runnerId: r.id,
-    domain: r.domain,
-    status: "skipped",
-    note,
-    findings: [],
-    durationMs: Date.now() - start,
-  };
-}

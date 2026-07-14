@@ -1,9 +1,70 @@
 import {
   SEVERITY_ORDER,
   type Severity,
+  type Runner,
+  type RunnerContext,
   type RunnerResult,
   type Finding,
 } from "./types.js";
+
+/**
+ * Turn what a runner SAW into a verdict. This is the only place in lgtm that
+ * decides a domain is clean, and it will only do so when the runner's own
+ * sufficiency rule confirms the coverage backs that claim.
+ *
+ * A runner cannot reach this decision itself: `RunnerOutcome` has no status
+ * field to set. That is deliberate — the old contract let every runner assert
+ * `status: "ok"` next to an empty findings array, which is exactly how a
+ * scanner that never looked reports a clean bill of health.
+ *
+ * It lives here, beside the scoring rules it feeds and away from the runner
+ * registry, so a runner's own tests can exercise the real decision path
+ * without importing every other runner in the fleet.
+ */
+export async function derive(
+  runner: Runner,
+  ctx: RunnerContext,
+  start: number = Date.now(),
+): Promise<RunnerResult> {
+  const base = { runnerId: runner.id, domain: runner.domain };
+  const outcome = await runner.observe(ctx);
+  const durationMs = Date.now() - start;
+
+  if (outcome.kind === "notApplicable" || outcome.kind === "unavailable") {
+    return {
+      ...base,
+      status: "skipped",
+      note: outcome.note,
+      findings: [],
+      durationMs,
+      waived: outcome.kind === "notApplicable",
+    };
+  }
+  if (outcome.kind === "failed") {
+    return {
+      ...base,
+      status: "error",
+      note: outcome.note,
+      findings: [],
+      durationMs,
+      meta: outcome.meta,
+    };
+  }
+
+  const why = runner.sufficient(outcome.coverage, ctx);
+  return {
+    ...base,
+    status: why ? "error" : "ok",
+    note: why ? `insufficient evidence — ${why}` : outcome.note,
+    // Findings stay attached even when the evidence is too thin to conclude:
+    // whatever the tool did see is still worth reading, and dropping it here
+    // would make the report contradict its own severity counts.
+    findings: outcome.findings,
+    durationMs,
+    meta: outcome.meta,
+    coverage: outcome.coverage,
+  };
+}
 
 export function severityRank(s: Severity): number {
   return SEVERITY_ORDER.indexOf(s);

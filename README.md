@@ -26,8 +26,28 @@ behind a single authenticated, local-first workflow and a unified report.
 | `zap` | DAST | OWASP ZAP | black-box | ZAP (docker) |
 
 **Black-box** runners need only a reachable URL. **White-box** runners need the
-repo checkout (`repoPath` in the site config) and auto-skip without it.
-Docker-hosted scanners auto-skip if Docker isn't running — nothing else breaks.
+repo checkout (`repoPath` in the site config). Docker-hosted scanners need
+Docker running.
+
+A runner that cannot run does **not** quietly drop out: the domain it covers
+went unaudited, and the run fails. If that is intentional — you genuinely do not
+want ZAP against this site — waive it explicitly with `skip:` in the site
+config. The waiver is reported; the run can still pass.
+
+That is the rule the whole tool is built around:
+
+> **A scan that examined nothing is not a clean scan.** Every runner reports
+> what it actually looked at — lockfiles walked, commits read, URLs spidered,
+> pages rendered — and a verdict of "clean" is *derived* from that evidence,
+> never asserted by the scanner itself. No evidence, no pass.
+
+So `lgtm` goes red on things a scanner usually goes green on: a secret scan
+pointed at a directory that isn't a git repo, a dependency scan whose only
+lockfile is gitignored, a Semgrep run over a language its rulesets don't parse,
+a ZAP baseline whose spider never got past the front door, an axe audit of a
+page that rendered an empty body. Each of those exits 0 and reports nothing. None
+of them looked at anything. Every report states its own coverage, so you can
+check the claim rather than take it.
 
 ## Setup
 

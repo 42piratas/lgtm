@@ -1,8 +1,14 @@
 import { mkdirSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { promises as dns } from "node:dns";
-import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
-import { hasDocker, dockerRun, transientInfraFailureUnless } from "../util/docker.js";
+import type {
+  Coverage,
+  Finding,
+  Runner,
+  RunnerContext,
+  RunnerOutcome,
+} from "../types.js";
+import { dockerRun, transientInfraFailureUnless } from "../util/docker.js";
 import { hostOf, isLocalhostUrl } from "../util/http.js";
 
 // TLS/transport assessment via drwetter/testssl.sh in a container.
@@ -54,16 +60,30 @@ export const tlsRunner: Runner = {
   domain: "transport",
   title: "TLS / transport security",
   requires: { target: true, docker: true },
-  async run(ctx: RunnerContext): Promise<RunnerResult> {
-    const start = Date.now();
+
+  /**
+   * testssl.sh emits one JSON record per test it performed — the OK ones too.
+   * An empty result set therefore does not mean "no TLS problems", it means
+   * the scan never reached the host (DNS, firewall, handshake refused). Only
+   * a run that actually performed tests can be read as clean.
+   */
+  sufficient(cov: Coverage): string | null {
+    const tests = Number(cov.data.testsPerformed ?? 0);
+    if (tests === 0) {
+      return "testssl.sh performed no tests — the host was never reached";
+    }
+    return null;
+  },
+
+  async observe(ctx: RunnerContext): Promise<RunnerOutcome> {
     const findings: Finding[] = [];
     const url = ctx.run.baseUrl;
 
     if (!url.startsWith("https://") || isLocalhostUrl(url)) {
-      return skip(this, start, "no TLS to inspect (http/localhost target)");
-    }
-    if (!(await hasDocker())) {
-      return skip(this, start, "docker unavailable (testssl.sh image needs it)");
+      return {
+        kind: "unavailable",
+        note: "no TLS to inspect (http/localhost target)",
+      };
     }
 
     const host = hostOf(url);
@@ -106,12 +126,8 @@ export const tlsRunner: Runner = {
 
       if (!existsSync(outPath)) {
         return {
-          runnerId: this.id,
-          domain: this.domain,
-          status: "error",
+          kind: "failed",
           note: "testssl.sh wrote no JSON (image/network/mount issue)",
-          findings,
-          durationMs: Date.now() - start,
         };
       }
 
@@ -127,12 +143,8 @@ export const tlsRunner: Runner = {
         parsed = Array.isArray(raw) ? raw : (raw?.scanResult ?? []);
       } catch (err) {
         return {
-          runnerId: this.id,
-          domain: this.domain,
-          status: "error",
+          kind: "failed",
           note: `testssl.sh wrote unparseable JSON: ${(err as Error).message}`,
-          findings,
-          durationMs: Date.now() - start,
         };
       }
 
@@ -156,14 +168,6 @@ export const tlsRunner: Runner = {
         });
       }
 
-      if (findings.length === 0) {
-        findings.push({
-          id: "tls-ok",
-          title: "No TLS issues at LOW+ severity",
-          severity: "info",
-        });
-      }
-
       // Say out loud what was and wasn't covered. Scanning one endpoint of a
       // multi-endpoint host is the right default (every edge of a CDN serves
       // the same TLS config, and scanning all of them just duplicates the
@@ -183,12 +187,21 @@ export const tlsRunner: Runner = {
       }
 
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "ok",
+        kind: "observed",
         note: total > 1 ? `1 of ${total} endpoints (${ip})` : undefined,
         findings,
-        durationMs: Date.now() - start,
+        coverage: {
+          trail: [
+            `resolved ${host} → ${total} endpoint${total === 1 ? "" : "s"}; scanned ${ip ?? "first"}`,
+            `testssl.sh performed ${parsed.length} test${parsed.length === 1 ? "" : "s"} (all severities, including the passing ones)`,
+          ],
+          data: {
+            testsPerformed: parsed.length,
+            endpointsResolved: total,
+            endpointScanned: ip ?? "",
+          },
+          provenance: "testssl.sh --jsonfile output",
+        },
         meta: { endpointScanned: ip, endpointsResolved: total },
       };
     } finally {
@@ -196,14 +209,3 @@ export const tlsRunner: Runner = {
     }
   },
 };
-
-function skip(r: Runner, start: number, note: string): RunnerResult {
-  return {
-    runnerId: r.id,
-    domain: r.domain,
-    status: "skipped",
-    note,
-    findings: [],
-    durationMs: Date.now() - start,
-  };
-}

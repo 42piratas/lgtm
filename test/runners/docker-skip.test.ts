@@ -1,104 +1,97 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { RunnerContext, SiteConfig } from "../../src/types.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { SiteConfig } from "../../src/types.js";
 
-// Every docker-hosted runner (tls, deps, secrets, sast, zap) self-checks
-// hasDocker() and must return a *visible* skipped result — never throw,
-// never silently report "clean" — when Docker is down. This is real
-// production code from src/runners/*, exercised through each runner's
-// public run(), with only util/docker.js's hasDocker mocked. No runner file
-// is modified.
+// Every docker-hosted runner (tls, deps, secrets, sast, zap) needs a Docker
+// daemon. That requirement is declared once, in `requires`, and enforced once,
+// in the orchestrator's gate — the runners no longer each re-implement the
+// check (and no longer each get to decide what a missing daemon means).
+//
+// Two things must hold when Docker is down:
+//   1. Each of those runners is visibly skipped — never a crash, and never a
+//      fabricated "clean".
+//   2. The RUN FAILS. Five security domains going unaudited is a coverage hole,
+//      not a detail: a green build on a machine with no Docker would certify a
+//      dependency tree, a secret history and a codebase nobody scanned.
 
 vi.mock("../../src/util/docker.js", async (importOriginal) => {
-  // Partial mock — the real retry predicates stay real (the runners import them).
   const actual = await importOriginal<typeof import("../../src/util/docker.js")>();
-  return {
-    ...actual,
-    hasDocker: vi.fn(),
-    dockerRun: vi.fn(),
-    containerReachableUrl: (u: string) => u,
-  };
+  return { ...actual, hasDocker: vi.fn(), dockerRun: vi.fn() };
 });
 
-// Belt and braces: zap.ts checks Docker before it probes the target, so this
-// file never reaches the network — but a future reordering must not silently
-// turn "runners skip when Docker is down" into a suite that needs the internet.
-vi.mock("../../src/util/authgate.js", () => ({
-  probeTarget: async () => ({ ok: true }),
+// The suite must never reach the network: with Docker down we skip before any
+// runner would fetch, but a future reordering must not turn this file into one
+// that needs the internet.
+vi.mock("../../src/util/authgate.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/util/authgate.js")>();
+  return { ...actual, probeTarget: async () => ({ ok: false, note: "stubbed" }) };
+});
+vi.mock("../../src/util/http.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/util/http.js")>();
+  return { ...actual, fetchUrl: async () => { throw new Error("stubbed"); } };
+});
+vi.mock("playwright", () => ({
+  chromium: { launch: async () => { throw new Error("stubbed"); } },
 }));
 
 const { hasDocker } = await import("../../src/util/docker.js");
-const { tlsRunner } = await import("../../src/runners/tls.js");
-const { depsRunner } = await import("../../src/runners/deps.js");
-const { secretsRunner } = await import("../../src/runners/secrets.js");
-const { sastRunner } = await import("../../src/runners/sast.js");
-const { zapRunner } = await import("../../src/runners/zap.js");
+const { runAudit } = await import("../../src/orchestrator.js");
 
-function ctx(overrides: Partial<{ baseUrl: string; repoPath?: string }> = {}): RunnerContext {
-  const baseUrl = overrides.baseUrl ?? "https://example.com";
-  const site: SiteConfig = {
-    name: "site",
-    baseUrl,
-    repoPath: overrides.repoPath,
-    routes: [],
-    auth: { type: "none" },
-    failOn: "high",
-  };
-  return {
-    site,
-    run: { baseUrl, isLocalhost: false, allowActive: false, outDir: "", stamp: "" },
-    urls: [baseUrl],
-    caps: { docker: false, browser: true },
-    log: () => {},
-  };
-}
+const DOCKER_RUNNERS = ["tls", "deps", "secrets", "sast", "zap"];
+
+let repo: string;
 
 beforeEach(() => {
   vi.mocked(hasDocker).mockReset();
   vi.mocked(hasDocker).mockResolvedValue(false);
+  repo = mkdtempSync(join(tmpdir(), "lgtm-repo-"));
 });
 
-describe("docker-hosted runners skip visibly when Docker is down", () => {
-  it("tls: skips with a docker-specific note (given an https, non-local target so it gets past the TLS-applicability check)", async () => {
-    const r = await tlsRunner.run(ctx({ baseUrl: "https://example.com" }));
-    expect(r.status).toBe("skipped");
-    expect(r.note).toMatch(/docker unavailable/i);
-  });
+function site(): SiteConfig {
+  return {
+    name: "site",
+    baseUrl: "https://example.com",
+    repoPath: repo,
+    routes: [],
+    auth: { type: "none" },
+    failOn: "high",
+  };
+}
 
-  it("deps: skips with a docker-specific note", async () => {
-    const r = await depsRunner.run(ctx({ repoPath: "/tmp/whatever" }));
-    expect(r.status).toBe("skipped");
-    expect(r.note).toMatch(/docker unavailable/i);
+async function audit(only?: string[]) {
+  const s = site();
+  return runAudit({
+    site: s,
+    baseUrl: s.baseUrl,
+    outDir: "",
+    stamp: "t",
+    allowActive: false,
+    only,
   });
+}
 
-  it("secrets: skips with a docker-specific note", async () => {
-    const r = await secretsRunner.run(ctx({ repoPath: "/tmp/whatever" }));
-    expect(r.status).toBe("skipped");
-    expect(r.note).toMatch(/docker unavailable/i);
-  });
-
-  it("sast: skips with a docker-specific note", async () => {
-    const r = await sastRunner.run(ctx({ repoPath: "/tmp/whatever" }));
-    expect(r.status).toBe("skipped");
-    expect(r.note).toMatch(/docker unavailable/i);
-  });
-
-  it("zap: skips with a docker-specific note", async () => {
-    const r = await zapRunner.run(ctx());
-    expect(r.status).toBe("skipped");
-    expect(r.note).toMatch(/docker unavailable/i);
-  });
-
-  it("none of these produce a passing/clean result while skipped — a skip must never masquerade as a pass", async () => {
-    const results = await Promise.all([
-      tlsRunner.run(ctx({ baseUrl: "https://example.com" })),
-      depsRunner.run(ctx({ repoPath: "/tmp/whatever" })),
-      secretsRunner.run(ctx({ repoPath: "/tmp/whatever" })),
-      sastRunner.run(ctx({ repoPath: "/tmp/whatever" })),
-      zapRunner.run(ctx()),
-    ]);
-    for (const r of results) {
+describe("docker-hosted runners are gated, not crashed, when Docker is down", () => {
+  it.each(DOCKER_RUNNERS)(
+    "%s: skipped with a docker-specific reason, and no fabricated findings",
+    async (id) => {
+      const report = await audit([id]);
+      const r = report.results.find((x) => x.runnerId === id)!;
       expect(r.status).toBe("skipped");
-      expect(r.findings).toEqual([]); // no fabricated "ok" finding standing in for a real scan
-    }
+      expect(r.note).toMatch(/docker unavailable/i);
+      expect(r.findings).toEqual([]);
+      rmSync(repo, { recursive: true, force: true });
+    },
+  );
+
+  it("a skip is never a pass — the run FAILS, because those domains went unaudited", async () => {
+    const report = await audit(DOCKER_RUNNERS);
+    expect(report.complete).toBe(false);
+    expect(report.passed).toBe(false);
+    // Every one of them is named as a hole, not quietly waived.
+    const holes = report.notAudited.filter((n) => !n.waived).map((n) => n.runnerId);
+    expect(holes.sort()).toEqual([...DOCKER_RUNNERS].sort());
+    rmSync(repo, { recursive: true, force: true });
   });
 });

@@ -1,5 +1,13 @@
-import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
-import { hasDocker, dockerRun } from "../util/docker.js";
+import { mkdirSync, readFileSync, existsSync, rmSync, chmodSync } from "node:fs";
+import { join } from "node:path";
+import type {
+  Coverage,
+  Finding,
+  Runner,
+  RunnerContext,
+  RunnerOutcome,
+} from "../types.js";
+import { dockerRun } from "../util/docker.js";
 
 // Leaked-credential scan via gitleaks (container), over the repo's git history
 // and working tree. White-box: needs the repo checkout.
@@ -15,75 +23,130 @@ interface Leak {
   Secret?: string;
 }
 
+/**
+ * gitleaks says what it did on stderr and nowhere else:
+ *
+ *   INF 14 commits scanned.
+ *   INF scanned ~554058 bytes (554.06 KB) in 338ms
+ *   INF no leaks found
+ *
+ * Point it at a directory that is not a git repo and it prints "0 commits
+ * scanned", "no leaks found", and exits 0 — a clean bill of health for a scan
+ * that read nothing. The commit and byte counts are the only way to tell that
+ * apart from a genuinely clean repo, so they are the coverage.
+ */
+function scanLog(stderr: string): { commits: number; bytes: number } {
+  const commits = stderr.match(/(\d+) commits scanned/);
+  const bytes = stderr.match(/scanned ~(\d+) bytes/);
+  return {
+    commits: commits ? Number(commits[1]) : 0,
+    bytes: bytes ? Number(bytes[1]) : 0,
+  };
+}
+
 export const secretsRunner: Runner = {
   id: "secrets",
   domain: "secrets",
   title: "Leaked secrets (gitleaks)",
   requires: { repo: true, docker: true },
-  async run(ctx: RunnerContext): Promise<RunnerResult> {
-    const start = Date.now();
+
+  sufficient(cov: Coverage): string | null {
+    if (Number(cov.data.commits ?? 0) === 0) {
+      return "gitleaks scanned 0 commits — the path is not a git repository, or has no history";
+    }
+    if (Number(cov.data.bytes ?? 0) === 0) {
+      return "gitleaks read 0 bytes — nothing was actually examined";
+    }
+    return null;
+  },
+
+  async observe(ctx: RunnerContext): Promise<RunnerOutcome> {
     const findings: Finding[] = [];
     const repo = ctx.site.repoPath!;
 
-    if (!(await hasDocker())) {
-      return skip(this, start, "docker unavailable (gitleaks image needs it)");
-    }
+    // The report goes to a FILE in a bind-mounted work dir, never to
+    // `--report-path /dev/stdout`.
+    //
+    // gitleaks accepts /dev/stdout without complaint and then writes nothing to
+    // it — verified against the pinned image (v8.30.1): a repo with two planted
+    // AWS keys logs "leaks found: 2" on stderr and delivers 0 bytes on stdout,
+    // while the same scan pointed at a real path writes a 1223-byte JSON array.
+    // This runner read stdout. It has therefore never reported a single leaked
+    // secret: every repo, clean or compromised, came back with nothing to say.
+    // The old code was accidentally shielded from shipping that as a pass (it
+    // read empty stdout as a crash and errored); reading it as "clean" — which
+    // is what an evidence contract SHOULD do with a scan that examined 14
+    // commits and found nothing — would have turned a loud wrong answer into a
+    // silent one. The bug is the flag, so fix the flag.
+    const work = join(process.cwd(), "reports", ".work", `secrets-${ctx.run.stamp}`);
+    mkdirSync(work, { recursive: true });
+    chmodSync(work, 0o777); // the image runs as a non-root uid
+    const reportPath = join(work, "gitleaks.json");
 
-    // Report to stdout as JSON; exit-code 0 so we read output ourselves.
-    const r = await dockerRun({
-      image: IMAGE,
-      args: [
-        "detect",
-        "--source",
-        "/repo",
-        "--report-format",
-        "json",
-        "--report-path",
-        "/dev/stdout",
-        "--redact",
-        "--no-banner",
-        "--exit-code",
-        "0",
-      ],
-      mounts: { "/repo": repo },
-      timeoutMs: 300_000,
-    });
-
-    // A clean gitleaks JSON report is still a `[]` on stdout — if there's no
-    // `[` at all, or what follows it isn't a JSON array, the tool didn't
-    // actually report anything (crash, killed, wrong flags). That's
-    // "unknown", not "no secrets": defaulting `leaks` to `[]` in that case
-    // (as this code used to) makes a dead scan indistinguishable from a
-    // clean one, and the `!Array.isArray` check below it never caught that
-    // because the default was already an array.
-    const s = r.stdout.indexOf("[");
-    if (s < 0) {
-      return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
-        note: `gitleaks produced no parseable output (exit ${r.code}): ${(r.stderr || r.stdout).slice(0, 300)}`,
-        findings,
-        durationMs: Date.now() - start,
-      };
-    }
-    let leaks: Leak[];
     try {
-      const parsed = JSON.parse(r.stdout.slice(s));
-      if (!Array.isArray(parsed)) throw new Error("gitleaks report was not a JSON array");
-      leaks = parsed;
-    } catch (err) {
-      return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
-        note: `gitleaks produced unparseable output: ${(err as Error).message}`,
-        findings,
-        durationMs: Date.now() - start,
-      };
-    }
+      const r = await dockerRun({
+        image: IMAGE,
+        args: [
+          "detect",
+          "--source",
+          "/repo",
+          "--report-format",
+          "json",
+          "--report-path",
+          "/out/gitleaks.json",
+          "--redact",
+          "--no-banner",
+          "--exit-code",
+          "0", // findings are not a failure — we read the report ourselves
+        ],
+        mounts: { "/repo": repo },
+        mountsRW: { "/out": work },
+        timeoutMs: 300_000,
+      });
 
-    // Collapse duplicate rule+file pairs (a secret repeated across history).
+      const { commits, bytes } = scanLog(r.stderr);
+
+      // No report file at all means gitleaks never got as far as writing one:
+      // a bad flag, a crash, a killed container. That is unknown, not clean.
+      if (!existsSync(reportPath)) {
+        return {
+          kind: "failed",
+          note: `gitleaks wrote no report (exit ${r.code}): ${(r.stderr || r.stdout).slice(0, 300)}`,
+        };
+      }
+
+      const raw = readFileSync(reportPath, "utf8").trim();
+      // A clean repo yields an empty file — not `[]`. That is a real result, and
+      // `sufficient()` decides whether the scan behind it was real, using the
+      // commit and byte counts.
+      let leaks: Leak[] = [];
+      if (raw.length > 0) {
+        try {
+          const parsed = JSON.parse(raw);
+          if (!Array.isArray(parsed)) throw new Error("report was not a JSON array");
+          leaks = parsed;
+        } catch (err) {
+          return {
+            kind: "failed",
+            note: `gitleaks produced unparseable output: ${(err as Error).message}`,
+          };
+        }
+      }
+      return collect(leaks, commits, bytes, findings);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  },
+};
+
+function collect(
+  leaks: Leak[],
+  commits: number,
+  bytes: number,
+  findings: Finding[],
+): RunnerOutcome {
+  // Collapse duplicate rule+file pairs (a secret repeated across history).
+  {
     const seen = new Set<string>();
     for (const leak of leaks) {
       const key = `${leak.RuleID}:${leak.File}:${leak.StartLine}`;
@@ -100,32 +163,18 @@ export const secretsRunner: Runner = {
       });
     }
 
-    if (findings.length === 0) {
-      findings.push({
-        id: "secrets-ok",
-        title: "No leaked secrets detected in tree or history",
-        severity: "info",
-      });
-    }
-
     return {
-      runnerId: this.id,
-      domain: this.domain,
-      status: "ok",
+      kind: "observed",
       findings,
-      durationMs: Date.now() - start,
-      meta: { leakCount: findings.filter((f) => f.severity !== "info").length },
+      coverage: {
+        trail: [
+          `scanned ${commits} commit${commits === 1 ? "" : "s"} of history`,
+          `read ${bytes} bytes of content`,
+        ],
+        data: { commits, bytes },
+        provenance: "gitleaks scan log (stderr)",
+      },
+      meta: { leakCount: findings.length, commits, bytes },
     };
-  },
-};
-
-function skip(r: Runner, start: number, note: string): RunnerResult {
-  return {
-    runnerId: r.id,
-    domain: r.domain,
-    status: "skipped",
-    note,
-    findings: [],
-    durationMs: Date.now() - start,
-  };
+  }
 }

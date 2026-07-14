@@ -98,14 +98,19 @@ export function badStatusReason(status: number): string | null {
   return `HTTP ${status} — could not fetch the real page; findings are unknown, not absent`;
 }
 
-export interface ProbeResult {
-  ok: boolean;
-  /** Set whenever ok === false — always human-readable and loud. */
-  note?: string;
-  status?: number;
-  finalUrl?: string;
-  headers?: Record<string, string>;
-}
+/**
+ * A refusal always carries its reason. Modelled as a union rather than an
+ * optional `note`, so a caller cannot forget to say WHY it refused — the
+ * silent-refusal case is how a scanner ends up reporting nothing at all.
+ */
+export type ProbeResult =
+  | {
+      ok: true;
+      status: number;
+      finalUrl: string;
+      headers: Record<string, string>;
+    }
+  | { ok: false; note: string; status?: number; finalUrl?: string };
 
 /**
  * For runners that don't already do their own plain-HTTP fetch (a11y,

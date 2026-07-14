@@ -1,4 +1,10 @@
-import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
+import type {
+  Coverage,
+  Finding,
+  Runner,
+  RunnerContext,
+  RunnerOutcome,
+} from "../types.js";
 import { isLocalhostUrl } from "../util/http.js";
 import {
   detectAuthGate,
@@ -37,8 +43,17 @@ export const cookiesRunner: Runner = {
   domain: "privacy",
   title: "Cookie hygiene & CSRF signal",
   requires: { target: true },
-  async run(ctx: RunnerContext): Promise<RunnerResult> {
-    const start = Date.now();
+
+  /**
+   * A site that legitimately sets no cookies has nothing to get wrong, so an
+   * empty cookie jar IS a clean result here — but only once we have actually
+   * read a response. Never seeing one is the case that must not pass.
+   */
+  sufficient(cov: Coverage): string | null {
+    return cov.data.responded ? null : "no response was read from the target";
+  },
+
+  async observe(ctx: RunnerContext): Promise<RunnerOutcome> {
     const findings: Finding[] = [];
     const url = ctx.run.baseUrl;
     const https = url.startsWith("https://") && !isLocalhostUrl(url);
@@ -47,14 +62,7 @@ export const cookiesRunner: Runner = {
     // util/retry.ts); a bad *status* does not — that's a definite answer.
     const attempt = await fetchTarget(url);
     if (!attempt.res) {
-      return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
-        note: unreachableNote(url, attempt.err),
-        findings,
-        durationMs: Date.now() - start,
-      };
+      return { kind: "failed", note: unreachableNote(url, attempt.err) };
     }
     const res = attempt.res;
 
@@ -63,25 +71,11 @@ export const cookiesRunner: Runner = {
     // would silently misreport as "clean".
     const gate = detectAuthGate(url, res.finalUrl);
     if (gate.gated) {
-      return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
-        note: `refusing to score — ${gate.reason}`,
-        findings,
-        durationMs: Date.now() - start,
-      };
+      return { kind: "failed", note: `refusing to score — ${gate.reason}` };
     }
     const bad = badStatusReason(res.status);
     if (bad) {
-      return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
-        note: `refusing to score — ${bad}`,
-        findings,
-        durationMs: Date.now() - start,
-      };
+      return { kind: "failed", note: `refusing to score — ${bad}` };
     }
 
     const cookies = res.setCookie.map(parseCookie);
@@ -148,23 +142,19 @@ export const cookiesRunner: Runner = {
       });
     }
 
-    if (findings.length === 0) {
-      findings.push({
-        id: "cookies-ok",
-        title:
-          cookies.length === 0
-            ? "No cookies set on the base response"
-            : "All cookies carry sound security attributes",
-        severity: "info",
-      });
-    }
-
     return {
-      runnerId: this.id,
-      domain: this.domain,
-      status: "ok",
+      kind: "observed",
       findings,
-      durationMs: Date.now() - start,
+      coverage: {
+        trail: [
+          `GET ${url} → ${res.status} (${res.finalUrl})`,
+          cookies.length === 0
+            ? "response set no cookies"
+            : `inspected ${cookies.length} cookie${cookies.length === 1 ? "" : "s"}: ${cookies.map((c) => c.name).join(", ")}`,
+        ],
+        data: { responded: true, status: res.status, cookies: cookies.length },
+        provenance: "Set-Cookie headers of the base URL response",
+      },
       meta: { cookieCount: cookies.length },
     };
   },

@@ -45,6 +45,14 @@ function sampleReport(overrides: Partial<AuditReport> = {}): AuditReport {
     ],
     totals: { critical: 0, high: 1, medium: 0, low: 0, info: 0 },
     passed: false,
+    complete: false,
+    notAudited: [
+      {
+        runnerId: "deps",
+        reason: "no repoPath configured — this domain was never scanned",
+        waived: false,
+      },
+    ],
     failOn: "high",
     ...overrides,
   };
@@ -73,7 +81,7 @@ describe("writeReports — JSON contract", () => {
     expect(htmlContents).toContain("FAIL");
   });
 
-  it("reflects a passing run's shape too (skipped-only, no real findings)", () => {
+  it("reflects a passing run's shape too — clean means no findings AND full coverage", () => {
     workDir = mkdtempSync(join(tmpdir(), "lgtm-report-test-"));
     cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(workDir);
 
@@ -83,17 +91,25 @@ describe("writeReports — JSON contract", () => {
           runnerId: "headers",
           domain: "security",
           status: "ok",
-          findings: [{ id: "headers-ok", title: "all good", severity: "info" }],
+          findings: [],
           durationMs: 10,
+          coverage: {
+            trail: ["GET https://example.com → 200"],
+            data: { responded: true, checksEvaluated: 7 },
+            provenance: "response headers of the base URL",
+          },
         },
       ],
-      totals: { critical: 0, high: 0, medium: 0, low: 0, info: 1 },
+      totals: { critical: 0, high: 0, medium: 0, low: 0, info: 0 },
       passed: true,
+      complete: true,
+      notAudited: [],
     });
     const { json } = writeReports(report);
     const parsed = JSON.parse(readFileSync(json, "utf8"));
     expect(parsed.passed).toBe(true);
-    expect(parsed.totals.info).toBe(1);
+    expect(parsed.complete).toBe(true);
+    expect(parsed.notAudited).toEqual([]);
   });
 
   // 42L-1003: an errored runner can still carry real findings — authz reports
@@ -151,11 +167,16 @@ describe("report.ts — countAtOrAbove (the number the operator actually reads)"
         totals: totals as AuditReport["totals"],
         failOn,
         passed: false,
+        // Full coverage, so the ONLY thing the verdict line has to report is
+        // the finding count — otherwise the unaudited-domain clause leads and
+        // this test would be reading the wrong number.
+        complete: true,
+        notAudited: [],
         results: [],
       }),
     );
     const rendered = readFileSync(html, "utf8");
-    const m = rendered.match(/FAIL — (\d+) finding/);
+    const m = rendered.match(/(\d+) findings? at or above/);
     expect(m).not.toBeNull();
     return Number(m![1]);
   }

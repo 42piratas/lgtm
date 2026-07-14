@@ -1,8 +1,14 @@
 // lgtm — shared contracts.
 //
-// A Runner probes one domain (headers, a11y, secrets, …) and returns Findings.
-// The orchestrator selects runners, resolves their capability requirements,
-// runs them, and the reporter scores + renders the aggregate.
+// A Runner probes one domain (headers, a11y, secrets, …) and reports what it
+// SAW: findings plus the coverage that backs them. It never says whether that
+// is good enough. The orchestrator alone turns an observation into a verdict,
+// by asking the runner's own `sufficient()` rule whether the coverage supports
+// a conclusion at all, and refusing when it does not.
+//
+// The rule this encodes: "no findings" is only "clean" if we can show the tool
+// actually looked. Absence of evidence is not evidence of absence — and a
+// runner is never allowed to assert its own pass.
 
 export type Severity = "critical" | "high" | "medium" | "low" | "info";
 
@@ -51,6 +57,61 @@ export interface Finding {
   needsReview?: boolean;
 }
 
+/**
+ * What a runner actually looked at — the receipts behind its findings.
+ *
+ * This is the whole point of the contract: a scanner that returns zero
+ * findings and zero coverage has not found a clean site, it has found
+ * nothing, and those two must never render the same. Every runner has to
+ * hand back the units of work it genuinely performed, read out of the tool's
+ * own output — never inferred, never assumed, never defaulted.
+ */
+export interface Coverage {
+  /**
+   * Human-readable receipts, one line per unit of work actually done
+   * ("scanned package-lock.json — 304 packages", "GET / → 200"). Rendered
+   * verbatim in the report so a reader can check the claim themselves.
+   */
+  trail: string[];
+  /**
+   * The machine-checkable counts `sufficient()` reads. Keys are the runner's
+   * own ("urls", "commits", "sources", "rules"). Numbers here MUST come from
+   * the tool's output, not from what we hoped it would do.
+   */
+  data: Record<string, number | string | boolean>;
+  /** Which tool output the numbers were read out of — stdout, stderr, report file. */
+  provenance: string;
+}
+
+/**
+ * A runner's raw report. Deliberately has NO status field: deciding whether an
+ * observation amounts to a pass is the orchestrator's job, not the runner's.
+ *
+ *   observed      — the tool ran and produced output we could read.
+ *   notApplicable — the domain does not exist for this target (no TLS to
+ *                   inspect on an http://localhost dev server). Nothing was
+ *                   missed, so this does not hold the run back.
+ *   unavailable   — the tool could not run here (no Docker, no repo checkout).
+ *                   The domain DOES apply and went unaudited: a coverage hole,
+ *                   and the run cannot pass on it.
+ *   failed        — the tool ran but produced nothing usable (crash, truncated
+ *                   output, auth gate, dead page). Not a verdict either.
+ *
+ * The distinction between the middle two is the load-bearing one. "There is no
+ * TLS here" and "we never checked the TLS" both used to render as a grey dash.
+ */
+export type RunnerOutcome =
+  | {
+      kind: "observed";
+      findings: Finding[];
+      coverage: Coverage;
+      note?: string;
+      meta?: Record<string, unknown>;
+    }
+  | { kind: "notApplicable"; note: string }
+  | { kind: "unavailable"; note: string }
+  | { kind: "failed"; note: string; meta?: Record<string, unknown> };
+
 export type RunnerStatus = "ok" | "skipped" | "error";
 
 export interface RunnerResult {
@@ -64,6 +125,15 @@ export interface RunnerResult {
   durationMs: number;
   /** Free-form metrics surfaced in the report (lighthouse scores, counts). */
   meta?: Record<string, unknown>;
+  /** The receipts. Present whenever the runner observed anything at all. */
+  coverage?: Coverage;
+  /**
+   * True when this domain went unaudited for an accepted reason: the operator
+   * waived the runner (site `skip:` or `--only`), or the domain does not apply
+   * to this target at all. An UNexcused absence is a coverage hole and fails
+   * the run; an excused one is only reported.
+   */
+  waived?: boolean;
 }
 
 /** What a runner needs present to be able to run. */
@@ -85,7 +155,15 @@ export interface Runner {
   domain: Domain;
   title: string;
   requires: RunnerRequirements;
-  run(ctx: RunnerContext): Promise<RunnerResult>;
+  /** Look. Report findings + the coverage behind them. Never judge. */
+  observe(ctx: RunnerContext): Promise<RunnerOutcome>;
+  /**
+   * Is this coverage enough to conclude anything about the domain?
+   * Return null when it is, or a short reason when it is not ("spidered 0
+   * URLs", "no lockfiles walked"). The orchestrator calls this — a runner
+   * cannot skip the question, and cannot answer it about itself.
+   */
+  sufficient(coverage: Coverage, ctx: RunnerContext): string | null;
 }
 
 export type AuthConfig =
@@ -111,7 +189,12 @@ export interface SiteConfig {
   auth: AuthConfig;
   /** Fail the run (exit 1) if any finding is at or above this severity. */
   failOn: Severity;
-  /** Runner ids to skip for this site. */
+  /**
+   * Runner ids the operator explicitly waives for this site. A waiver is a
+   * decision on the record: the domain is reported as not audited, and the
+   * run may still pass. Anything that fails to run WITHOUT a waiver is a
+   * coverage hole and fails the run instead.
+   */
   skip?: string[];
 }
 
@@ -156,7 +239,16 @@ export interface AuditReport {
   allowActive: boolean;
   results: RunnerResult[];
   totals: Record<Severity, number>;
-  /** Overall pass/fail against the site's failOn threshold. */
+  /**
+   * Overall pass. Requires BOTH: nothing at or above failOn, AND full
+   * coverage. A run that never audited half the domains cannot pass — that
+   * is the same false all-clear as a runner asserting its own success, just
+   * one level up.
+   */
   passed: boolean;
+  /** Every runner either produced a verdict or was explicitly waived. */
+  complete: boolean;
+  /** Domains with no verdict — the coverage holes. Empty on a complete run. */
+  notAudited: Array<{ runnerId: string; reason: string; waived: boolean }>;
   failOn: Severity;
 }

@@ -1,8 +1,13 @@
 import { mkdirSync, readFileSync, existsSync, rmSync, chmodSync } from "node:fs";
 import { join } from "node:path";
-import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
+import type {
+  Coverage,
+  Finding,
+  Runner,
+  RunnerContext,
+  RunnerOutcome,
+} from "../types.js";
 import {
-  hasDocker,
   dockerRun,
   containerReachableUrl,
   transientInfraFailureUnless,
@@ -35,34 +40,59 @@ interface ZapReport {
   }>;
 }
 
+/**
+ * ZAP's JSON report carries alerts and nothing else — it cannot tell you
+ * whether the spider reached one page or a hundred, and a scan that crawled
+ * nothing produces the same empty alert list as a spotless site. Its stdout
+ * does say, though:
+ *
+ *   Total of 12 URLs                                 (needs -d)
+ *   FAIL-NEW: 0  ...  INFO: 3  IGNORE: 0  PASS: 58   (always printed)
+ *
+ * `PASS` counts the passive rules that ran and matched nothing — proof the
+ * rule engine actually executed. Both are read here; neither is inferred.
+ */
+function crawlLog(stdout: string): { urls: number; rules: number } {
+  const urls = stdout.match(/Total of (\d+) URLs/);
+  const tally = stdout.match(
+    /FAIL-NEW:\s*(\d+)\s+FAIL-INPROG:\s*(\d+)\s+WARN-NEW:\s*(\d+)\s+WARN-INPROG:\s*(\d+)\s+INFO:\s*(\d+)\s+IGNORE:\s*(\d+)\s+PASS:\s*(\d+)/,
+  );
+  const rules = tally
+    ? tally.slice(1).reduce((n, x) => n + Number(x), 0)
+    : 0;
+  return { urls: urls ? Number(urls[1]) : 0, rules };
+}
+
 export const zapRunner: Runner = {
   id: "zap",
   domain: "dast",
   title: "Dynamic scan (OWASP ZAP)",
   requires: { target: true, docker: true },
-  async run(ctx: RunnerContext): Promise<RunnerResult> {
-    const start = Date.now();
+
+  /**
+   * A dynamic scan is only worth as much as the surface it reached. Zero
+   * spidered URLs means ZAP never got into the app (unreachable host, a JS-only
+   * shell with no crawlable links, a login wall) — and its silence about that
+   * app is not a clean result.
+   */
+  sufficient(cov: Coverage): string | null {
+    if (Number(cov.data.urlsSpidered ?? 0) === 0) {
+      return "the spider reached 0 URLs — the app was never crawled";
+    }
+    if (Number(cov.data.rulesRun ?? 0) === 0) {
+      return "no scan rules ran against the crawled pages";
+    }
+    return null;
+  },
+
+  async observe(ctx: RunnerContext): Promise<RunnerOutcome> {
     const findings: Finding[] = [];
 
-    // Cheapest disqualifier first. If Docker isn't there we're skipping
-    // regardless of what the target says, so don't reach out over the network
-    // just to throw the answer away — a skip should cost nothing.
-    if (!(await hasDocker())) {
-      return skip(this, start, "docker unavailable (ZAP image needs it)");
-    }
-
-    // Then refuse before spending a ZAP container run on content that isn't the
+    // Refuse before spending a ZAP container run on content that isn't the
     // site: an auth-gate redirect or a non-2xx/3xx response.
     const probe = await probeTarget(ctx.run.baseUrl);
     if (!probe.ok) {
-      return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
-        note: probe.note,
-        findings,
-        durationMs: Date.now() - start,
-      };
+      return { kind: "failed", note: probe.note };
     }
 
     const active = ctx.run.isLocalhost && ctx.run.allowActive;
@@ -78,7 +108,10 @@ export const zapRunner: Runner = {
 
     const r = await dockerRun({
       image: IMAGE,
-      args: [script, "-t", target, "-J", reportName, "-I"],
+      // -d (detailed) is what makes ZAP print "Total of N URLs". Without it the
+      // spider's reach is unknowable, and an empty report is unreadable: it
+      // could mean a clean app or an app that was never crawled at all.
+      args: [script, "-t", target, "-J", reportName, "-I", "-d"],
       mountsRW: { "/zap/wrk": workDir },
       extra: ["--add-host=host.docker.internal:host-gateway"],
       timeoutMs: active ? 1_200_000 : 420_000,
@@ -89,15 +122,13 @@ export const zapRunner: Runner = {
       // The report file is the ground truth: if it's there, we're done.
       retryOn: transientInfraFailureUnless(() => existsSync(reportPath)),
     });
+    const crawl = crawlLog(r.stdout);
+
     if (!existsSync(reportPath)) {
       rmSync(workDir, { recursive: true, force: true });
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
+        kind: "failed",
         note: `ZAP produced no report (exit ${r.code}): ${r.stderr.slice(0, 250)}`,
-        findings,
-        durationMs: Date.now() - start,
       };
     }
 
@@ -111,12 +142,8 @@ export const zapRunner: Runner = {
     } catch (err) {
       rmSync(workDir, { recursive: true, force: true });
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
+        kind: "failed",
         note: `ZAP report was not parseable JSON: ${(err as Error).message}`,
-        findings,
-        durationMs: Date.now() - start,
       };
     }
     rmSync(workDir, { recursive: true, force: true });
@@ -141,32 +168,22 @@ export const zapRunner: Runner = {
       }
     }
 
-    if (findings.length === 0) {
-      findings.push({
-        id: "zap-ok",
-        title: `ZAP ${active ? "active" : "passive"} scan found no low+ alerts`,
-        severity: "info",
-      });
-    }
-
     return {
-      runnerId: this.id,
-      domain: this.domain,
-      status: "ok",
-      note: active ? "active full-scan" : "passive baseline (pass --allow-active on localhost for active)",
+      kind: "observed",
+      note: active
+        ? "active full-scan"
+        : "passive baseline (pass --allow-active on localhost for active)",
       findings,
-      durationMs: Date.now() - start,
+      coverage: {
+        trail: [
+          `${active ? "active full-scan" : "passive baseline"} of ${ctx.run.baseUrl}`,
+          `spider reached ${crawl.urls} URL${crawl.urls === 1 ? "" : "s"}`,
+          `${crawl.rules} scan rule${crawl.rules === 1 ? "" : "s"} ran against them`,
+        ],
+        data: { urlsSpidered: crawl.urls, rulesRun: crawl.rules, active },
+        provenance: "zap-baseline URL count + rule tally (stdout)",
+      },
+      meta: { urlsSpidered: crawl.urls, rulesRun: crawl.rules },
     };
   },
 };
-
-function skip(r: Runner, start: number, note: string): RunnerResult {
-  return {
-    runnerId: r.id,
-    domain: r.domain,
-    status: "skipped",
-    note,
-    findings: [],
-    durationMs: Date.now() - start,
-  };
-}
