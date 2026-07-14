@@ -17,6 +17,14 @@ interface FakeNav {
   landed: string;
   status: number;
   headers?: Record<string, string>;
+  /**
+   * Make page.goto() REJECT, the way a real one does on a timeout, a redirect
+   * loop, or a connection reset — all routine when a WAF decides it doesn't
+   * like the scanner. Without this the suite could not see the runner's
+   * nav-failure path at all, which is precisely how authz.ts came to claim
+   * "protected routes enforce auth" about routes it never managed to load.
+   */
+  throws?: string;
 }
 
 // url → what the authed context sees / what the anonymous context sees.
@@ -30,6 +38,7 @@ function makeContext(navMap: Record<string, FakeNav>) {
       return {
         goto: async (url: string) => {
           const nav = navMap[url] ?? { landed: url, status: 200, headers: {} };
+          if (nav.throws) throw new Error(nav.throws);
           current = nav.landed;
           return {
             status: () => nav.status,
@@ -201,5 +210,106 @@ describe("authz.ts — authed-session health and response cacheability", () => {
     expect(r.findings.filter((f) => f.severity !== "info")).toEqual([]);
     expect(r.findings.find((f) => f.id === "authz-ok")).toBeDefined();
     expect(r.meta?.sessionWorks).toBe(true);
+  });
+});
+
+
+// ── The nav-failure hole (42L-973 final review) ─────────────────────────────
+//
+// Both goto() calls used to sit in `try { … } catch { /* non-fatal */ }`. If a
+// navigation blew up — timeout, redirect loop, connection reset, all realistic
+// against a live WAF — the route produced NO finding: not open, not blocked,
+// not even a note. And then, if nothing else was wrong, `authz-ok` fired
+// anyway: "Protected routes enforce auth."
+//
+// That is a definite claim about a route that was never checked, inside the one
+// runner whose entire job is catching broken access control. Unchecked is not
+// safe; it is unknown, and unknown has to fail the run.
+
+describe("authzRunner — a route that could not be loaded was NOT verified", () => {
+  it("never claims authz-ok when the anonymous probe failed to load the route", async () => {
+    anonNav = {
+      "https://example.com/dashboard": {
+        landed: "",
+        status: 0,
+        throws: "page.goto: Timeout 30000ms exceeded",
+      },
+    };
+    const r = await authzRunner.run(ctx(["/dashboard"]));
+
+    // The bug: this used to be "ok" + authz-ok, i.e. a clean bill of health.
+    expect(r.status).toBe("error");
+    expect(r.findings.find((f) => f.id === "authz-ok")).toBeUndefined();
+    expect(r.note).toMatch(/could not verify access control/i);
+    expect(r.note).toMatch(/unknown, not absent/i);
+  });
+
+  it("emits a visible, reviewable finding naming the route it could not check", async () => {
+    anonNav = {
+      "https://example.com/dashboard": {
+        landed: "",
+        status: 0,
+        throws: "net::ERR_CONNECTION_RESET",
+      },
+    };
+    const r = await authzRunner.run(ctx(["/dashboard"]));
+
+    const unchecked = r.findings.find((f) => f.id.startsWith("authz-unchecked"))!;
+    expect(unchecked).toBeDefined();
+    expect(unchecked.needsReview).toBe(true); // visible, never silently dropped
+    expect(unchecked.title).toMatch(/NOT verified/);
+    expect(unchecked.title).toMatch(/dashboard/);
+    expect(unchecked.location).toBe("https://example.com/dashboard");
+  });
+
+  it("also refuses when it is the AUTHED probe that failed to load", async () => {
+    authedNav = {
+      "https://example.com/dashboard": {
+        landed: "",
+        status: 0,
+        throws: "page.goto: Timeout 30000ms exceeded",
+      },
+    };
+    const r = await authzRunner.run(ctx(["/dashboard"]));
+    expect(r.status).toBe("error");
+    expect(r.findings.find((f) => f.id === "authz-ok")).toBeUndefined();
+  });
+
+  it("still reports a genuinely open route found alongside one it could not check — a nav failure removes certainty, it does not erase evidence", async () => {
+    anonNav = {
+      // Wide open: anonymous 200, no login redirect. Must survive.
+      "https://example.com/admin": { landed: "https://example.com/admin", status: 200 },
+      // Unreachable: unknown.
+      "https://example.com/billing": { landed: "", status: 0, throws: "Timeout" },
+    };
+    const r = await authzRunner.run(ctx(["/admin", "/billing"]));
+
+    const open = r.findings.find((f) => f.id.startsWith("authz-open"))!;
+    expect(open).toBeDefined();
+    expect(open.severity).toBe("high"); // the A01 finding is not lost
+    expect(r.findings.some((f) => f.id.startsWith("authz-unchecked"))).toBe(true);
+    expect(r.status).toBe("error");
+  });
+
+  it("only counts the routes it actually failed on — a fully clean run is still clean", async () => {
+    // Authed request lands fine and is non-cacheable; anonymous request is
+    // bounced to login. Nothing failed to load, so nothing is unverified.
+    authedNav = {
+      "https://example.com/dashboard": {
+        landed: "https://example.com/dashboard",
+        status: 200,
+        headers: { "cache-control": "no-store" },
+      },
+    };
+    anonNav = {
+      "https://example.com/dashboard": {
+        landed: "https://example.com/login",
+        status: 200,
+      },
+    };
+    const r = await authzRunner.run(ctx(["/dashboard"]));
+    expect(r.status).toBe("ok");
+    expect(r.findings.find((f) => f.id === "authz-ok")).toBeDefined();
+    expect(r.findings.some((f) => f.id.startsWith("authz-unchecked"))).toBe(false);
   });
 });
