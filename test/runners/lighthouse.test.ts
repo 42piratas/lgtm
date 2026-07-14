@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { derive } from "../../src/scoring.js";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,12 +49,36 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-/** Shape lighthouse's lhr.categories the way the runner reads it. */
+/**
+ * Shape lighthouse's lhr the way the runner reads it.
+ *
+ * A real LHR NEVER has a category without auditRefs, or an auditRef without a
+ * matching entry in `audits` — a score is an average over audits, so a scored
+ * category that measured nothing is not a thing Lighthouse can emit. The
+ * fixture has to obey that, or the tests end up certifying behaviour against a
+ * report that could not exist, which is how the runner grew a false clean in
+ * the first place. Each category here gets one weighted audit that produced a
+ * value.
+ */
 function lhr(scores: Record<string, number>) {
+  const keys = Object.keys(scores);
   return {
     lhr: {
       categories: Object.fromEntries(
-        Object.entries(scores).map(([k, score]) => [k, { title: k, score }]),
+        keys.map((k) => [
+          k,
+          {
+            title: k,
+            score: scores[k],
+            auditRefs: [{ id: `${k}-audit`, weight: 1 }],
+          },
+        ]),
+      ),
+      audits: Object.fromEntries(
+        keys.map((k) => [
+          `${k}-audit`,
+          { title: `${k} audit`, scoreDisplayMode: "numeric" },
+        ]),
       ),
     },
   };
@@ -84,17 +109,20 @@ describe("lighthouse.ts — THRESHOLDS", () => {
     lighthouseMock.mockResolvedValue(
       lhr({ performance: 0.8, "best-practices": 0.9, seo: 0.9 }),
     );
-    const r = await lighthouseRunner.run(ctx());
-    expect(r.findings).toEqual([
-      expect.objectContaining({ id: "lh-ok", severity: "info" }),
-    ]);
+    const r = await derive(lighthouseRunner, ctx());
+    // Clean is now the ABSENCE of findings backed by the presence of evidence —
+    // never a self-declared "lh-ok" pass-note. The runner states what it
+    // measured; the orchestrator decides that amounts to a pass.
+    expect(r.findings).toEqual([]);
+    expect(r.status).toBe("ok");
+    expect(r.coverage?.data.categoriesScored).toBe(3);
   });
 
   it("flags each category that falls just below its own threshold", async () => {
     lighthouseMock.mockResolvedValue(
       lhr({ performance: 0.79, "best-practices": 0.89, seo: 0.89 }),
     );
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.findings.find((f) => f.id === "lh-performance")).toBeDefined();
     expect(r.findings.find((f) => f.id === "lh-best-practices")).toBeDefined();
     expect(r.findings.find((f) => f.id === "lh-seo")).toBeDefined();
@@ -102,20 +130,20 @@ describe("lighthouse.ts — THRESHOLDS", () => {
 
   it("applies the performance threshold (0.8), not the stricter 0.9 — a 0.85 perf score is fine but a 0.85 SEO score is not", async () => {
     lighthouseMock.mockResolvedValue(lhr({ performance: 0.85, seo: 0.85 }));
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.findings.find((f) => f.id === "lh-performance")).toBeUndefined();
     expect(r.findings.find((f) => f.id === "lh-seo")).toBeDefined();
   });
 
   it("ignores a category with no configured threshold (e.g. accessibility — a11y.ts owns that)", async () => {
     lighthouseMock.mockResolvedValue(lhr({ accessibility: 0.1 }));
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.findings.find((f) => f.id === "lh-accessibility")).toBeUndefined();
   });
 
   it("surfaces the raw scores in meta regardless of pass/fail", async () => {
     lighthouseMock.mockResolvedValue(lhr({ performance: 0.42, seo: 1 }));
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.meta?.scores).toEqual({ performance: 0.42, seo: 1 });
   });
 });
@@ -123,14 +151,14 @@ describe("lighthouse.ts — THRESHOLDS", () => {
 describe("lighthouse.ts — SEVERITY_BY_SCORE", () => {
   it("scores below 0.5 are medium; 0.5 and above are low", async () => {
     lighthouseMock.mockResolvedValue(lhr({ performance: 0.49, seo: 0.5 }));
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.findings.find((f) => f.id === "lh-performance")!.severity).toBe("medium");
     expect(r.findings.find((f) => f.id === "lh-seo")!.severity).toBe("low");
   });
 
   it("a catastrophic 0 score is medium (the mapping tops out there)", async () => {
     lighthouseMock.mockResolvedValue(lhr({ performance: 0 }));
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.findings.find((f) => f.id === "lh-performance")!.severity).toBe("medium");
   });
 });
@@ -156,20 +184,20 @@ describe("lighthouse.ts — cookieHeaderFrom (authed scoring)", () => {
       { name: "session", value: "abc", domain: "example.com" },
       { name: "theme", value: "dark", domain: ".example.com" }, // leading-dot form
     ]);
-    await lighthouseRunner.run(ctx({ path: p }));
+    await derive(lighthouseRunner, ctx({ path: p }));
     expect(sentCookie()).toBe("session=abc; theme=dark");
   });
 
   it("does not leak cookies scoped to a different domain into the request", async () => {
     lighthouseMock.mockResolvedValue(lhr({ performance: 1 }));
     const p = writeState([{ name: "other", value: "xyz", domain: "attacker.test" }]);
-    await lighthouseRunner.run(ctx({ path: p }));
+    await derive(lighthouseRunner, ctx({ path: p }));
     expect(sentCookie()).toBeUndefined();
   });
 
   it("sends no Cookie header when the storageState file does not exist", async () => {
     lighthouseMock.mockResolvedValue(lhr({ performance: 1 }));
-    await lighthouseRunner.run(ctx({ path: join(dir, "missing.json") }));
+    await derive(lighthouseRunner, ctx({ path: join(dir, "missing.json") }));
     expect(sentCookie()).toBeUndefined();
   });
 
@@ -177,14 +205,14 @@ describe("lighthouse.ts — cookieHeaderFrom (authed scoring)", () => {
     lighthouseMock.mockResolvedValue(lhr({ performance: 1 }));
     const p = join(dir, "bad.json");
     writeFileSync(p, "{ not json");
-    const r = await lighthouseRunner.run(ctx({ path: p }));
+    const r = await derive(lighthouseRunner, ctx({ path: p }));
     expect(sentCookie()).toBeUndefined();
     expect(r.status).toBe("ok");
   });
 
   it("sends no Cookie header for an unauthenticated site config", async () => {
     lighthouseMock.mockResolvedValue(lhr({ performance: 1 }));
-    await lighthouseRunner.run(ctx());
+    await derive(lighthouseRunner, ctx());
     expect(sentCookie()).toBeUndefined();
   });
 });
@@ -192,7 +220,7 @@ describe("lighthouse.ts — cookieHeaderFrom (authed scoring)", () => {
 describe("lighthouse.ts — failure modes", () => {
   it("errors (not silently passes) when Chrome cannot be launched", async () => {
     launchMock.mockRejectedValue(new Error("no chrome"));
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.status).toBe("error");
     expect(r.note).toMatch(/could not launch Chrome/i);
     expect(r.findings).toEqual([]);
@@ -200,7 +228,7 @@ describe("lighthouse.ts — failure modes", () => {
 
   it("errors when lighthouse itself throws", async () => {
     lighthouseMock.mockRejectedValue(new Error("lh exploded"));
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.status).toBe("error");
     expect(r.note).toMatch(/lh exploded/);
   });
@@ -217,7 +245,7 @@ describe("lighthouse.ts — failure modes", () => {
     "errors (never reports a clean pass) when lighthouse %s",
     async (_label, resolved) => {
       lighthouseMock.mockResolvedValue(resolved);
-      const r = await lighthouseRunner.run(ctx());
+      const r = await derive(lighthouseRunner, ctx());
       expect(r.status).toBe("error");
       expect(r.findings).toEqual([]);
       expect(r.findings.map((f) => f.id)).not.toContain("lh-ok");
@@ -252,7 +280,7 @@ describe("lighthouseRunner — an unmeasured page is never a passing page (42L-1
     lighthouseMock.mockResolvedValue({
       lhr: { ...NULL_SCORES.lhr, runtimeError: { code, message } },
     });
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.status).toBe("error");
     expect(r.findings).toEqual([]);
     expect(r.note).toMatch(new RegExp(code));
@@ -261,7 +289,7 @@ describe("lighthouseRunner — an unmeasured page is never a passing page (42L-1
 
   it("errors when every category came back unscored, even with no runtimeError", async () => {
     lighthouseMock.mockResolvedValue(NULL_SCORES);
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.status).toBe("error");
     expect(r.findings).toEqual([]);
     expect(r.note).toMatch(/unknown, not passing/i);
@@ -272,7 +300,7 @@ describe("lighthouseRunner — an unmeasured page is never a passing page (42L-1
     // all `medium` (SEVERITY_BY_SCORE(0) < 0.5), none of which reach the default
     // failOn: "high". The run passed. It must now refuse instead.
     lighthouseMock.mockResolvedValue(NULL_SCORES);
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.status).not.toBe("ok");
     expect(r.findings.filter((f) => f.severity === "medium")).toHaveLength(0);
     expect(r.findings.map((f) => f.id)).not.toContain("lh-performance");
@@ -350,7 +378,7 @@ describe("lighthouseRunner — an unmeasured page is never a passing page (42L-1
         OK_AUDITS,
       ),
     );
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.status).toBe("error");
     expect(r.note).toMatch(/best-practices/);
     expect(r.note).toMatch(/unknown, not passing/i);
@@ -373,7 +401,7 @@ describe("lighthouseRunner — an unmeasured page is never a passing page (42L-1
         OK_AUDITS,
       ),
     );
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
 
     // Sanity-check the fixture really reproduces Lighthouse's behaviour: an
     // all-not-applicable category scores 0, not null. If this ever asserts null,
@@ -408,7 +436,7 @@ describe("lighthouseRunner — an unmeasured page is never a passing page (42L-1
         OK_AUDITS,
       ),
     );
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.status).toBe("error");
     expect(r.note).toMatch(/never measured/i);
   });
@@ -431,7 +459,7 @@ describe("lighthouseRunner — an unmeasured page is never a passing page (42L-1
         },
       },
     });
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.status).toBe("ok");
   });
 
@@ -439,7 +467,7 @@ describe("lighthouseRunner — an unmeasured page is never a passing page (42L-1
     lighthouseMock.mockResolvedValue(
       lhr({ performance: 0.42, "best-practices": 0.95, seo: 0.95 }),
     );
-    const r = await lighthouseRunner.run(ctx());
+    const r = await derive(lighthouseRunner, ctx());
     expect(r.status).toBe("ok");
     // performance 0.42 < 0.8 → a real finding, at medium (score < 0.5).
     expect(r.findings.find((f) => f.id === "lh-performance")?.severity).toBe("medium");

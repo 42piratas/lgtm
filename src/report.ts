@@ -79,13 +79,21 @@ export function consoleSummary(report: AuditReport): string {
   lines.push("");
 
   const errored = report.results.filter((r) => r.status === "error");
-  const skipped = report.results.filter((r) => r.status === "skipped");
-  if (skipped.length > 0) {
+  const holes = report.notAudited.filter((n) => !n.waived);
+  const waived = report.notAudited.filter((n) => n.waived);
+
+  if (holes.length > 0) {
     lines.push(
-      pc.yellow(
-        `  ${skipped.length} runner${skipped.length === 1 ? "" : "s"} skipped — no coverage: ${skipped
-          .map((r) => `${r.runnerId} (${r.note ?? "no reason given"})`)
-          .join("; ")}`,
+      pc.red(
+        `  ${holes.length} domain${holes.length === 1 ? "" : "s"} went unaudited — this run cannot be read as clean:`,
+      ),
+    );
+    for (const h of holes) lines.push(pc.red(`    ${h.runnerId} — ${h.reason}`));
+  }
+  if (waived.length > 0) {
+    lines.push(
+      pc.dim(
+        `  not audited (accepted): ${waived.map((w) => w.runnerId).join(", ")}`,
       ),
     );
   }
@@ -94,15 +102,26 @@ export function consoleSummary(report: AuditReport): string {
   lines.push(
     `  totals: ${SEV_COLOR.critical(`${t.critical} critical`)} · ${SEV_COLOR.high(`${t.high} high`)} · ${SEV_COLOR.medium(`${t.medium} medium`)} · ${SEV_COLOR.low(`${t.low} low`)}`,
   );
+
+  const why: string[] = [];
+  if (errored.length > 0) {
+    why.push(
+      `${errored.length} runner${errored.length === 1 ? "" : "s"} could not conclude: ${errored.map((r) => r.runnerId).join(", ")}`,
+    );
+  }
+  if (countAtOrAbove(report)) why.push(`findings ≥ ${report.failOn}`);
+  if (holes.length > 0) {
+    why.push(
+      `${holes.length} unaudited domain${holes.length === 1 ? "" : "s"}: ${holes.map((h) => h.runnerId).join(", ")}`,
+    );
+  }
   lines.push(
     report.passed
-      ? pc.green(`  PASS `) + pc.dim(`(no findings ≥ ${report.failOn}, no runner errors)`)
-      : pc.red(`  FAIL `) +
+      ? pc.green(`  PASS `) +
           pc.dim(
-            errored.length > 0
-              ? `(${errored.length} runner${errored.length === 1 ? "" : "s"} errored: ${errored.map((r) => r.runnerId).join(", ")}${countAtOrAbove(report) ? ` · findings ≥ ${report.failOn}` : ""})`
-              : `(findings ≥ ${report.failOn} threshold)`,
-          ),
+            `(every domain audited, nothing ≥ ${report.failOn}, every verdict backed by evidence)`,
+          )
+      : pc.red(`  FAIL `) + pc.dim(`(${why.join(" · ")})`),
   );
   lines.push("");
   return lines.join("\n");
@@ -150,30 +169,67 @@ function renderVerdict(report: AuditReport): string {
   const t = report.totals;
   const atOrAbove = countAtOrAbove(report);
   const errored = report.results.filter((r) => r.status === "error");
+  const holes = report.notAudited.filter((n) => !n.waived);
   const cls = report.passed ? "pass" : "fail";
   let text: string;
   if (report.passed) {
-    text = `PASS — no findings at or above <b>${report.failOn}</b>, no runner errors`;
-  } else if (errored.length > 0) {
-    const ids = errored.map((r) => esc(r.runnerId)).join(", ");
-    text = `FAIL — ${errored.length} runner${errored.length === 1 ? "" : "s"} errored (<b>${ids}</b>) — a scan that couldn't see the site is not a clean bill of health${atOrAbove ? `, plus ${atOrAbove} finding${atOrAbove === 1 ? "" : "s"} at or above <b>${report.failOn}</b>` : ""}`;
+    text = `PASS — every domain was audited, every verdict is backed by evidence, and nothing landed at or above <b>${report.failOn}</b>`;
   } else {
-    text = `FAIL — ${atOrAbove} finding${atOrAbove === 1 ? "" : "s"} at or above <b>${report.failOn}</b>`;
+    const parts: string[] = [];
+    if (holes.length > 0) {
+      const ids = holes.map((h) => esc(h.runnerId)).join(", ");
+      parts.push(
+        `${holes.length} domain${holes.length === 1 ? "" : "s"} went unaudited (<b>${ids}</b>) — a domain nobody looked at cannot be reported as sound`,
+      );
+    }
+    if (errored.length > 0) {
+      const ids = errored.map((r) => esc(r.runnerId)).join(", ");
+      parts.push(
+        `${errored.length} runner${errored.length === 1 ? "" : "s"} could not conclude (<b>${ids}</b>) — a scan that couldn't see the site is not a clean bill of health`,
+      );
+    }
+    if (atOrAbove > 0) {
+      parts.push(
+        `${atOrAbove} finding${atOrAbove === 1 ? "" : "s"} at or above <b>${report.failOn}</b>`,
+      );
+    }
+    text = `FAIL — ${parts.join("; ")}`;
   }
   return `<div class="verdict ${cls}"><span class="badge ${cls}">${report.passed ? "PASS" : "FAIL"}</span> ${text}
     <span class="vsum">${t.critical + t.high} high-severity · ${t.medium} medium · ${t.low} low</span></div>`;
 }
 
-/** Skips must be visible and reasoned — a callout, not a greyed-out row that
- *  blends into a table full of "clean" results. */
+/**
+ * What was NOT audited, and whether that was a decision or an accident. A grey
+ * "—" row in a table full of green ticks reads as fine; it isn't. An unwaived
+ * gap is called what it is, in red, at the top.
+ */
 function renderCoverage(report: AuditReport): string {
-  const skipped = report.results.filter((r) => r.status === "skipped");
-  if (skipped.length === 0) return "";
-  const items = skipped
-    .map((r) => `<li><b>${esc(r.runnerId)}</b> — ${esc(r.note ?? "no reason given")}</li>`)
-    .join("");
-  return `<div class="coverage"><b>${skipped.length} runner${skipped.length === 1 ? "" : "s"} not run — no coverage here:</b>
-    <ul>${items}</ul></div>`;
+  if (report.notAudited.length === 0) return "";
+  const holes = report.notAudited.filter((n) => !n.waived);
+  const waived = report.notAudited.filter((n) => n.waived);
+  const block = (
+    title: string,
+    items: AuditReport["notAudited"],
+    cls: string,
+  ): string =>
+    items.length === 0
+      ? ""
+      : `<div class="coverage ${cls}"><b>${title}</b><ul>${items
+          .map((n) => `<li><b>${esc(n.runnerId)}</b> — ${esc(n.reason)}</li>`)
+          .join("")}</ul></div>`;
+  return (
+    block(
+      `${holes.length} domain${holes.length === 1 ? "" : "s"} went unaudited — this run has no coverage here, and cannot be read as clean:`,
+      holes,
+      "hole",
+    ) +
+    block(
+      `Not audited, accepted (${waived.length}):`,
+      waived,
+      "waived",
+    )
+  );
 }
 
 function renderKpis(report: AuditReport): string {
@@ -250,9 +306,20 @@ function renderRunnerSection(r: RunnerResult, index: number): string {
       <tbody>${rows}</tbody></table>`;
   };
 
+  // The receipts. "Clean" is a claim, and a claim the reader is entitled to
+  // check: this is the runner's own account of what it actually looked at,
+  // printed next to the verdict it supports.
+  const evidence = (): string => {
+    if (!r.coverage || r.coverage.trail.length === 0) return "";
+    const items = r.coverage.trail.map((t) => `<li>${esc(t)}</li>`).join("");
+    return `<div class="evidence"><b>Evidence — what was actually examined</b>
+      <ul>${items}</ul>
+      <p class="prov">source: ${esc(r.coverage.provenance)}</p></div>`;
+  };
+
   let body: string;
   if (r.status === "skipped") {
-    body = `<p class="empty skip">Skipped — no coverage${r.note ? `: ${esc(r.note)}` : ""}.</p>`;
+    body = `<p class="empty skip">Not audited${r.note ? ` — ${esc(r.note)}` : ""}.</p>`;
   } else if (r.status === "error") {
     // An errored runner can still carry real findings — authz, for instance,
     // reports the genuinely-open route it DID find alongside the routes it
@@ -269,6 +336,7 @@ function renderRunnerSection(r: RunnerResult, index: number): string {
   } else {
     body = findingsTable();
   }
+  body += evidence();
 
   return `<div class="secttl" id="r-${esc(r.runnerId)}"><span class="n">${num}</span> ${esc(r.runnerId)}
     <span class="grade sm" style="background:${GRADE_HEX[grade] ?? "#B8AFA8"}">${grade}</span>
@@ -332,6 +400,17 @@ function renderHtml(report: AuditReport): string {
   .coverage b{font-weight:600}
   .coverage ul{margin:6px 0 0;padding-left:18px}
   .coverage li{margin:2px 0;font-family:var(--font-mono);font-size:12px}
+  /* An unwaived gap is a defect, not a footnote — it reads red, like a failure. */
+  .coverage.hole{color:#991B1B;background:#FEF2F2;border-color:#FECACA;border-left-color:#DC2626}
+  .coverage.waived{color:var(--fg-muted);background:var(--surface-muted);border-color:var(--border);
+    border-left-color:#B8AFA8}
+
+  .evidence{margin:14px 0 0;padding:12px 15px;border:1px solid var(--border);
+    border-radius:8px;background:var(--surface-muted);font-size:12.5px}
+  .evidence b{font-weight:600;color:var(--fg)}
+  .evidence ul{margin:6px 0 0;padding-left:18px}
+  .evidence li{margin:2px 0;font-family:var(--font-mono);font-size:11.5px;color:var(--fg-muted)}
+  .evidence .prov{margin:8px 0 0;font-size:11px;color:var(--fg-muted);opacity:.8}
 
   .kpis{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0 4px}
   .kpi{flex:1;min-width:120px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:11px 13px}

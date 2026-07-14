@@ -1,7 +1,13 @@
 import { launch } from "chrome-launcher";
 import lighthouse from "lighthouse";
 import { readFileSync, existsSync } from "node:fs";
-import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
+import type {
+  Coverage,
+  Finding,
+  Runner,
+  RunnerContext,
+  RunnerOutcome,
+} from "../types.js";
 import { probeTarget } from "../util/authgate.js";
 
 // Performance / best-practices / SEO via Lighthouse. Category scores below
@@ -38,8 +44,24 @@ export const lighthouseRunner: Runner = {
   domain: "perf",
   title: "Lighthouse (perf / best-practices / SEO)",
   requires: { target: true, browser: true },
-  async run(ctx: RunnerContext): Promise<RunnerResult> {
-    const start = Date.now();
+
+  /**
+   * Lighthouse hands back a category score of 0 for a page it could not
+   * measure just as readily as for a page that measured badly (see the note
+   * on weighting below). A run that scored no category at all measured
+   * nothing, and has no verdict to give.
+   */
+  sufficient(cov: Coverage): string | null {
+    if (Number(cov.data.categoriesScored ?? 0) === 0) {
+      return "Lighthouse scored no category — the page was never measured";
+    }
+    if (Number(cov.data.auditsRun ?? 0) === 0) {
+      return "no Lighthouse audit produced a value";
+    }
+    return null;
+  },
+
+  async observe(ctx: RunnerContext): Promise<RunnerOutcome> {
     const findings: Finding[] = [];
     const url = ctx.run.baseUrl;
 
@@ -47,28 +69,14 @@ export const lighthouseRunner: Runner = {
     // an auth-gate redirect or a non-2xx/3xx response.
     const probe = await probeTarget(url);
     if (!probe.ok) {
-      return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
-        note: probe.note,
-        findings,
-        durationMs: Date.now() - start,
-      };
+      return { kind: "failed", note: probe.note };
     }
 
     const chrome = await launch({
       chromeFlags: ["--headless=new", "--no-sandbox", "--ignore-certificate-errors"],
     }).catch(() => null);
     if (!chrome) {
-      return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
-        note: "could not launch Chrome for Lighthouse",
-        findings,
-        durationMs: Date.now() - start,
-      };
+      return { kind: "failed", note: "could not launch Chrome for Lighthouse" };
     }
 
     const extraHeaders: Record<string, string> = {};
@@ -98,12 +106,8 @@ export const lighthouseRunner: Runner = {
       // the result is unknown, not good.
       if (!lhr || !lhr.categories) {
         return {
-          runnerId: this.id,
-          domain: this.domain,
-          status: "error",
-          findings: [],
+          kind: "failed",
           note: "Lighthouse returned no report — the scan produced no data, so the scores are unknown, not passing.",
-          durationMs: Date.now() - start,
         };
       }
 
@@ -117,12 +121,8 @@ export const lighthouseRunner: Runner = {
         .runtimeError;
       if (runtimeError?.code && runtimeError.code !== "NO_ERROR") {
         return {
-          runnerId: this.id,
-          domain: this.domain,
-          status: "error",
-          findings: [],
+          kind: "failed",
           note: `Lighthouse could not measure the page (${runtimeError.code}): ${runtimeError.message ?? "no detail"} — the scores are unknown, not passing.`,
-          durationMs: Date.now() - start,
         };
       }
 
@@ -169,15 +169,11 @@ export const lighthouseRunner: Runner = {
         );
         if (errored.length > 0) {
           return {
-            runnerId: this.id,
-            domain: this.domain,
-            status: "error",
-            findings: [],
+            kind: "failed",
             note: `Lighthouse audits errored, so ${key} could not be measured — the scores are unknown, not passing: ${errored
               .map((r) => audits[r.id]?.title ?? r.id)
               .slice(0, 3)
               .join("; ")}`,
-            durationMs: Date.now() - start,
           };
         }
 
@@ -200,12 +196,8 @@ export const lighthouseRunner: Runner = {
         // Null with nothing errored to explain it: unknown, and unknown is not clean.
         if (cat.score === null || cat.score === undefined) {
           return {
-            runnerId: this.id,
-            domain: this.domain,
-            status: "error",
-            findings: [],
+            kind: "failed",
             note: `Lighthouse returned no ${key} score — the category was not measured, so the score is unknown, not passing.`,
-            durationMs: Date.now() - start,
           };
         }
 
@@ -224,45 +216,40 @@ export const lighthouseRunner: Runner = {
         }
       }
 
-      // Nothing errored, but nothing scored either — the page was never measured.
-      if (Object.keys(scores).length === 0) {
-        return {
-          runnerId: this.id,
-          domain: this.domain,
-          status: "error",
-          findings: [],
-          note: "Lighthouse scored no categories at all — the page was never measured, so the scores are unknown, not passing.",
-          durationMs: Date.now() - start,
-        };
-      }
-
-      if (findings.length === 0) {
-        findings.push({
-          id: "lh-ok",
-          title: `Lighthouse category scores meet thresholds (${Object.keys(scores).join(", ")})`,
-          severity: "info",
-        });
-      }
+      // An audit that produced a value is an audit that ran. Lighthouse CI —
+      // Google's own build gate — treats "audit did not produce a value at all"
+      // as a hard failure for the same reason: a metric with nothing behind it
+      // cannot be asserted against a threshold.
+      const auditsRun = Object.values(audits).filter(
+        (a) => a.scoreDisplayMode && a.scoreDisplayMode !== "error",
+      ).length;
 
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "ok",
+        kind: "observed",
         note: notMeasured.length
           ? `not scored (no applicable audits): ${notMeasured.join(", ")}`
           : undefined,
         findings,
-        durationMs: Date.now() - start,
+        coverage: {
+          trail: [
+            `measured ${url}`,
+            `scored ${Object.keys(scores).length} of ${Object.keys(lhr.categories).length} categories (${Object.keys(scores).join(", ") || "none"})`,
+            `${auditsRun} audits produced a value`,
+            ...notMeasured.map((k) => `NOT scored: ${k} (no applicable audits)`),
+          ],
+          data: {
+            categoriesRequested: Object.keys(lhr.categories).length,
+            categoriesScored: Object.keys(scores).length,
+            auditsRun,
+          },
+          provenance: "Lighthouse LHR categories + audits",
+        },
         meta: { scores, notMeasured },
       };
     } catch (err) {
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
+        kind: "failed",
         note: `lighthouse failed: ${(err as Error).message}`,
-        findings,
-        durationMs: Date.now() - start,
       };
     } finally {
       try {

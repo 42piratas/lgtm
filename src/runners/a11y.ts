@@ -1,5 +1,11 @@
 import AxeBuilder from "@axe-core/playwright";
-import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
+import type {
+  Coverage,
+  Finding,
+  Runner,
+  RunnerContext,
+  RunnerOutcome,
+} from "../types.js";
 import { BrowserSession } from "../util/browser.js";
 import { probeTarget } from "../util/authgate.js";
 
@@ -261,8 +267,32 @@ export const a11yRunner: Runner = {
   domain: "a11y",
   title: "Accessibility (WCAG 2.2 AA, incl. color contrast)",
   requires: { target: true, browser: true },
-  async run(ctx: RunnerContext): Promise<RunnerResult> {
-    const start = Date.now();
+
+  /**
+   * Three ways axe reports a spotless page it never really saw: no pages were
+   * requested at all; a page failed to load and its violations were never
+   * collected; or the page loaded but rendered an empty body (error boundary,
+   * dead SPA shell) where almost every rule is inapplicable and so nothing can
+   * fail. All three are silence, not a pass.
+   */
+  sufficient(cov: Coverage): string | null {
+    const audited = Number(cov.data.pagesAudited ?? 0);
+    const requested = Number(cov.data.pagesRequested ?? 0);
+    if (requested === 0) return "no URLs were configured to audit";
+    if (audited === 0) return "no page could be loaded and audited";
+    if (audited < requested) {
+      return `only ${audited} of ${requested} pages loaded — the rest were never audited`;
+    }
+    if (Number(cov.data.elementsInspected ?? 0) === 0) {
+      return "every page rendered an empty body — axe had nothing to check";
+    }
+    if (Number(cov.data.rulesApplied ?? 0) === 0) {
+      return "no accessibility rule applied to any page";
+    }
+    return null;
+  },
+
+  async observe(ctx: RunnerContext): Promise<RunnerOutcome> {
     const findings: Finding[] = [];
 
     // Refuse before launching a browser session on content that isn't the
@@ -271,28 +301,7 @@ export const a11yRunner: Runner = {
     // site under audit.
     const probe = await probeTarget(ctx.run.baseUrl);
     if (!probe.ok) {
-      return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
-        note: probe.note,
-        findings,
-        durationMs: Date.now() - start,
-      };
-    }
-
-    // Zero pages audited is zero evidence. The old code walked an empty loop,
-    // counted zero violations, and reported "No WCAG 2.2 AA violations across
-    // 0 page(s)" — grade A for auditing nothing at all.
-    if (ctx.urls.length === 0) {
-      return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
-        note: "no URLs to audit — zero pages were scanned, so the result is unknown, not clean",
-        findings,
-        durationMs: Date.now() - start,
-      };
+      return { kind: "failed", note: probe.note };
     }
 
     const session = new BrowserSession(ctx.site);
@@ -307,7 +316,11 @@ export const a11yRunner: Runner = {
       // De-dup findings across pages by (rule, target); count occurrences.
       const seen = new Map<string, { finding: Finding; count: number }>();
       const failedNavigations: string[] = [];
+      const trail: string[] = [];
       let contrastNodes = 0;
+      let pagesAudited = 0;
+      let elementsInspected = 0;
+      let rulesApplied = 0;
 
       for (const url of ctx.urls) {
         // newPage() must be INSIDE the try: if it throws (browser crash, page
@@ -329,9 +342,34 @@ export const a11yRunner: Runner = {
             .catch(() => {});
           await revealLazyContent(page);
           await settleTransitions(page);
+          // Measured on the same settled DOM axe is about to be handed, and
+          // before it, so the count describes exactly what got audited.
+          const elements =
+            Number(
+              await page
+                .evaluate(() => document.querySelectorAll("body *").length)
+                .catch(() => 0),
+            ) || 0;
+
           const results = await new AxeBuilder({ page })
             .withTags(["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"])
             .analyze();
+
+          // What axe could actually see. A rule that was *applicable* either
+          // passed, failed, or came back incomplete — `inapplicable` ones are
+          // excluded, because a page that renders nothing makes nearly every
+          // rule inapplicable and would otherwise sail through with a perfect
+          // score for having no content to fail on.
+          const applied =
+            (results.passes?.length ?? 0) +
+            (results.violations?.length ?? 0) +
+            (results.incomplete?.length ?? 0);
+          pagesAudited++;
+          elementsInspected += elements;
+          rulesApplied += applied;
+          trail.push(
+            `audited ${url} — ${elements} elements, ${applied} applicable WCAG rules`,
+          );
 
           for (const v of results.violations) {
             let nodes = v.nodes;
@@ -415,48 +453,35 @@ export const a11yRunner: Runner = {
         }
       }
 
-      // Findings from the pages that DID load are real and must survive the
-      // error return below — a run that failed on page 3 still saw pages 1-2,
-      // and throwing their violations away would be its own kind of lie.
+      // Findings from the pages that DID load are real and must survive a
+      // partial failure — a run that died on page 3 still saw pages 1-2, and
+      // throwing their violations away would be its own kind of lie. The
+      // coverage below is what tells the orchestrator this run is short, so the
+      // findings can be reported without the result being read as complete.
       for (const { finding } of seen.values()) findings.push(finding);
 
-      if (failedNavigations.length > 0) {
-        return {
-          runnerId: this.id,
-          domain: this.domain,
-          status: "error",
-          note: `could not load ${failedNavigations.length} of ${ctx.urls.length} page(s) — the pages were never audited, so the result is unknown, not clean: ${failedNavigations.join("; ")}`,
-          findings,
-          durationMs: Date.now() - start,
-        };
-      }
-
-      const violationCount = [...seen.values()].length;
-      if (violationCount === 0) {
-        findings.push({
-          id: "a11y-ok",
-          title: `No WCAG 2.2 AA violations across ${ctx.urls.length} page(s)${authNote}`,
-          severity: "info",
-        });
-      }
+      for (const f of failedNavigations) trail.push(`FAILED to load ${f}`);
 
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "ok",
+        kind: "observed",
         note: authNote.trim() || undefined,
         findings,
-        durationMs: Date.now() - start,
-        meta: { pages: ctx.urls.length, contrastNodes },
+        coverage: {
+          trail,
+          data: {
+            pagesRequested: ctx.urls.length,
+            pagesAudited,
+            elementsInspected,
+            rulesApplied,
+          },
+          provenance: "axe-core results per page (passes + violations + incomplete)",
+        },
+        meta: { pages: pagesAudited, contrastNodes },
       };
     } catch (err) {
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
+        kind: "failed",
         note: `browser session failed: ${(err as Error).message}`,
-        findings,
-        durationMs: Date.now() - start,
       };
     } finally {
       await session.close();

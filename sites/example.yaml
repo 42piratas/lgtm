@@ -11,8 +11,13 @@ label: Example Site
 # server, then re-point at prod with `--url https://example.com`.
 baseUrl: http://localhost:3000
 
-# Optional. Absolute or ~/-relative path to the repo checkout. Unlocks the
-# white-box scanners (deps / secrets / sast). Omit and those auto-skip.
+# Path to the repo checkout (absolute, or ~/-relative). Unlocks the white-box
+# scanners: deps / secrets / sast.
+#
+# Omit it and those three cannot run — which means your dependencies, your git
+# history and your source code go unaudited, and the run FAILS. That is not a
+# technicality: a green build that never scanned any of them is worth nothing.
+# If you really don't want them here, waive them explicitly under `skip:` below.
 # repoPath: ~/code/example-app
 
 # Extra routes (paths or absolute URLs) to cover for a11y / perf / access-control.
@@ -33,6 +38,9 @@ auth:
 # One of: critical | high | medium | low
 failOn: high
 
-# Optional: runner ids to skip for this site.
+# Runners you explicitly waive for this site. A waiver is a decision on the
+# record: the report says the domain was not audited, and the run can still
+# pass. Anything that fails to run WITHOUT a waiver is a coverage hole and fails
+# the run instead.
 # skip:
 #   - zap

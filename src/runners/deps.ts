@@ -1,5 +1,11 @@
-import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
-import { hasDocker, dockerRun } from "../util/docker.js";
+import type {
+  Coverage,
+  Finding,
+  Runner,
+  RunnerContext,
+  RunnerOutcome,
+} from "../types.js";
+import { dockerRun } from "../util/docker.js";
 
 // Dependency CVEs via Google's osv-scanner (container). White-box: needs the
 // repo checkout. Reports lockfile-resolved vulnerabilities across ecosystems.
@@ -37,19 +43,51 @@ function cvssFrom(v: { severity?: Array<{ score?: string }> }): number | undefin
   return m ? Number(m[1]) : undefined;
 }
 
+/**
+ * osv-scanner's JSON lists only the sources that HAVE vulnerabilities — a
+ * fully clean repo and a repo where the walk found no lockfiles at all both
+ * come back as `{"results":[]}`. The proof of work is in the walk log it
+ * writes to stderr, one line per manifest it actually parsed:
+ *
+ *   Scanned /src/package-lock.json file and found 304 packages
+ *
+ * That line is the only place the tool says what it looked at, so that is
+ * where the coverage has to come from.
+ */
+function walkedSources(stderr: string): Array<{ path: string; packages: number }> {
+  const out: Array<{ path: string; packages: number }> = [];
+  const re = /Scanned (\S+) file and found (\d+) packages/g;
+  for (const m of stderr.matchAll(re)) {
+    out.push({ path: m[1]!, packages: Number(m[2]) });
+  }
+  return out;
+}
+
 export const depsRunner: Runner = {
   id: "deps",
   domain: "deps",
   title: "Dependency CVEs (osv-scanner)",
   requires: { repo: true, docker: true },
-  async run(ctx: RunnerContext): Promise<RunnerResult> {
-    const start = Date.now();
+
+  /**
+   * Zero lockfiles walked means the whole dependency tree went unexamined —
+   * the single most common way this runner lies, because a gitignored
+   * lockfile silently removes an entire ecosystem from the scan and the tool
+   * still exits reporting nothing.
+   */
+  sufficient(cov: Coverage): string | null {
+    if (Number(cov.data.sources ?? 0) === 0) {
+      return "no lockfiles or manifests were walked — nothing was audited";
+    }
+    if (Number(cov.data.packages ?? 0) === 0) {
+      return "the manifests that were walked resolved to zero packages";
+    }
+    return null;
+  },
+
+  async observe(ctx: RunnerContext): Promise<RunnerOutcome> {
     const findings: Finding[] = [];
     const repo = ctx.site.repoPath!;
-
-    if (!(await hasDocker())) {
-      return skip(this, start, "docker unavailable (osv-scanner image needs it)");
-    }
 
     // osv-scanner respects the repo's .gitignore by default. That's correct
     // for build output, but real lockfiles are routinely gitignored too —
@@ -82,15 +120,13 @@ export const depsRunner: Runner = {
       timeoutMs: 300_000,
     });
 
+    const sources = walkedSources(r.stderr);
+
     // osv-scanner exits 1 when vulns are found, 0 when clean, >1 on real error.
     if (r.code > 1 && !r.stdout.trim().startsWith("{")) {
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
+        kind: "failed",
         note: `osv-scanner error (exit ${r.code}): ${r.stderr.slice(0, 300)}`,
-        findings,
-        durationMs: Date.now() - start,
       };
     }
 
@@ -102,12 +138,8 @@ export const depsRunner: Runner = {
     const s = r.stdout.indexOf("{");
     if (s < 0) {
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
+        kind: "failed",
         note: `osv-scanner produced no parseable output (exit ${r.code}): ${(r.stderr || r.stdout).slice(0, 300)}`,
-        findings,
-        durationMs: Date.now() - start,
       };
     }
     let out: OsvOutput;
@@ -115,12 +147,8 @@ export const depsRunner: Runner = {
       out = JSON.parse(r.stdout.slice(s));
     } catch (err) {
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
+        kind: "failed",
         note: `osv-scanner produced unparseable JSON: ${(err as Error).message}`,
-        findings,
-        durationMs: Date.now() - start,
       };
     }
 
@@ -141,31 +169,19 @@ export const depsRunner: Runner = {
       }
     }
 
-    if (findings.length === 0) {
-      findings.push({
-        id: "deps-ok",
-        title: "No known dependency vulnerabilities",
-        severity: "info",
-      });
-    }
+    const packages = sources.reduce((n, s2) => n + s2.packages, 0);
 
     return {
-      runnerId: this.id,
-      domain: this.domain,
-      status: "ok",
+      kind: "observed",
       findings,
-      durationMs: Date.now() - start,
+      coverage: {
+        trail: sources.map(
+          (s2) => `walked ${s2.path.replace(/^\/src\/?/, "")} — ${s2.packages} packages`,
+        ),
+        data: { sources: sources.length, packages },
+        provenance: "osv-scanner walk log (stderr)",
+      },
+      meta: { sources: sources.map((s2) => s2.path), packages },
     };
   },
 };
-
-function skip(r: Runner, start: number, note: string): RunnerResult {
-  return {
-    runnerId: r.id,
-    domain: r.domain,
-    status: "skipped",
-    note,
-    findings: [],
-    durationMs: Date.now() - start,
-  };
-}

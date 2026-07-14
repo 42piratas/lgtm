@@ -1,4 +1,10 @@
-import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
+import type {
+  Coverage,
+  Finding,
+  Runner,
+  RunnerContext,
+  RunnerOutcome,
+} from "../types.js";
 import { isLocalhostUrl } from "../util/http.js";
 import {
   detectAuthGate,
@@ -119,22 +125,28 @@ export const headersRunner: Runner = {
   domain: "security",
   title: "Security headers",
   requires: { target: true },
-  async run(ctx: RunnerContext): Promise<RunnerResult> {
-    const start = Date.now();
+
+  /**
+   * The headers verdict rests on one response. If we never read one, or the
+   * check list somehow evaluated nothing, "no findings" says nothing about
+   * the site's headers.
+   */
+  sufficient(cov: Coverage): string | null {
+    if (!cov.data.responded) return "no response was read from the target";
+    if (Number(cov.data.checksEvaluated ?? 0) === 0) {
+      return "no header checks were evaluated";
+    }
+    return null;
+  },
+
+  async observe(ctx: RunnerContext): Promise<RunnerOutcome> {
     const findings: Finding[] = [];
     const url = ctx.run.baseUrl;
     // Transport failures get a bounded retry before we conclude anything (see
     // util/retry.ts); a bad *status* does not — that's a definite answer.
     const attempt = await fetchTarget(url);
     if (!attempt.res) {
-      return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
-        note: unreachableNote(url, attempt.err),
-        findings,
-        durationMs: Date.now() - start,
-      };
+      return { kind: "failed", note: unreachableNote(url, attempt.err) };
     }
     const res = attempt.res;
 
@@ -146,24 +158,16 @@ export const headersRunner: Runner = {
     const gate = detectAuthGate(url, res.finalUrl);
     if (gate.gated) {
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
+        kind: "failed",
         note: `refusing to score — ${gate.reason}`,
-        findings,
-        durationMs: Date.now() - start,
         meta: { finalUrl: res.finalUrl, status: res.status },
       };
     }
     const bad = badStatusReason(res.status);
     if (bad) {
       return {
-        runnerId: this.id,
-        domain: this.domain,
-        status: "error",
+        kind: "failed",
         note: `refusing to score — ${bad}`,
-        findings,
-        durationMs: Date.now() - start,
         meta: { finalUrl: res.finalUrl, status: res.status },
       };
     }
@@ -173,7 +177,9 @@ export const headersRunner: Runner = {
     const csp = h["content-security-policy"] ?? "";
     const cspFrameAncestors = /frame-ancestors/i.test(csp);
 
+    let checksEvaluated = 0;
     for (const c of CHECKS) {
+      checksEvaluated++;
       // XFO is satisfied by a CSP frame-ancestors directive.
       if (c.id === "x-frame-options" && cspFrameAncestors && !h[c.header]) {
         continue;
@@ -218,20 +224,22 @@ export const headersRunner: Runner = {
       });
     }
 
-    if (findings.length === 0) {
-      findings.push({
-        id: "headers-ok",
-        title: "All checked security headers present and strong",
-        severity: "info",
-      });
-    }
-
     return {
-      runnerId: this.id,
-      domain: this.domain,
-      status: "ok",
+      kind: "observed",
       findings,
-      durationMs: Date.now() - start,
+      coverage: {
+        trail: [
+          `GET ${url} → ${res.status} (${res.finalUrl})`,
+          `evaluated ${checksEvaluated} header check${checksEvaluated === 1 ? "" : "s"} + ${LEAKY.length} leak checks`,
+        ],
+        data: {
+          responded: true,
+          status: res.status,
+          checksEvaluated,
+          headersRead: Object.keys(h).length,
+        },
+        provenance: "response headers of the base URL",
+      },
       meta: { finalUrl: res.finalUrl, status: res.status },
     };
   },

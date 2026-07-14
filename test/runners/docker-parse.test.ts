@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { derive } from "../../src/scoring.js";
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -98,9 +99,24 @@ afterEach(() => {
   rmSync(workRoot, { recursive: true, force: true });
 });
 
-function ok(stdout: string, code = 0) {
-  return { code, stdout, stderr: "", timedOut: false };
+function ok(stdout: string, code = 0, stderr = "") {
+  return { code, stdout, stderr, timedOut: false };
 }
+
+// The scan logs the real tools print, and which the runners now read their
+// coverage out of. A fixture that omits them is not a "clean scan" fixture —
+// it is a scan that never ran, and the runner is right to refuse it.
+//
+// Verified against the real images (osv-scanner 2.x, gitleaks v8.30,
+// zaproxy:stable), not invented: `osv-scanner` announces each manifest it
+// walked on stderr and lists ONLY vulnerable sources in its JSON; `gitleaks`
+// announces its commit and byte counts on stderr and writes NOTHING at all to
+// the report path when a repo is clean; `zap-baseline.py` prints its spidered
+// URL count and its rule tally on stdout.
+const OSV_WALKED = "Scanned /src/package-lock.json file and found 304 packages\n";
+const GITLEAKS_SCANNED = "14 commits scanned.\nscanned ~554058 bytes (554.06 KB) in 338ms\n";
+const ZAP_CRAWLED =
+  "Total of 12 URLs\nFAIL-NEW: 0\tFAIL-INPROG: 0\tWARN-NEW: 2\tWARN-INPROG: 0\tINFO: 1\tIGNORE: 0\tPASS: 58\n";
 
 function ctx(overrides: Partial<{ baseUrl: string; repoPath: string }> = {}): RunnerContext {
   const baseUrl = overrides.baseUrl ?? "https://example.com";
@@ -142,7 +158,7 @@ describe("tls.ts — testssl severity mapping", () => {
       { id: "cert_expiry", severity: "LOW", finding: "30 days" },
       { id: "TLS1_1", severity: "WARN", finding: "deprecated" },
     ]);
-    const r = await tlsRunner.run(ctx());
+    const r = await derive(tlsRunner, ctx());
     const sev = (id: string) => r.findings.find((f) => f.id === `tls-${id}`)?.severity;
     expect(sev("heartbleed")).toBe("critical");
     expect(sev("RC4")).toBe("high");
@@ -156,10 +172,13 @@ describe("tls.ts — testssl severity mapping", () => {
       { id: "cipherlist", severity: "OK", finding: "all good" },
       { id: "protocols", severity: "INFO", finding: "TLS1.3 offered" },
     ]);
-    const r = await tlsRunner.run(ctx());
-    expect(r.findings).toEqual([
-      expect.objectContaining({ id: "tls-ok", severity: "info" }),
-    ]);
+    const r = await derive(tlsRunner, ctx());
+    expect(r.status).toBe("ok");
+    expect(r.findings).toEqual([]);
+    // The OK/INFO entries were still TESTS testssl performed — they are the
+    // proof it reached the host, which is what makes "no issues" readable as
+    // clean rather than as silence.
+    expect(r.coverage?.data.testsPerformed).toBe(2);
   });
 
   it("reads the nested scanResult shape as well as a flat array", async () => {
@@ -172,20 +191,20 @@ describe("tls.ts — testssl severity mapping", () => {
       );
       return ok("");
     });
-    const r = await tlsRunner.run(ctx());
+    const r = await derive(tlsRunner, ctx());
     expect(r.findings.find((f) => f.id === "tls-RC4")?.severity).toBe("high");
   });
 
   it("errors (not silently passes) when testssl writes no JSON at all", async () => {
     dockerRunMock.mockResolvedValue(ok(""));
-    const r = await tlsRunner.run(ctx());
+    const r = await derive(tlsRunner, ctx());
     expect(r.status).toBe("error");
     expect(r.note).toMatch(/no JSON/i);
     expect(r.findings).toEqual([]);
   });
 
   it("skips an http/localhost target — there is no TLS to inspect", async () => {
-    const r = await tlsRunner.run(ctx({ baseUrl: "http://localhost:3000" }));
+    const r = await derive(tlsRunner, ctx({ baseUrl: "http://localhost:3000" }));
     expect(r.status).toBe("skipped");
     expect(dockerRunMock).not.toHaveBeenCalled();
   });
@@ -226,9 +245,10 @@ describe("deps.ts — CVSS → severity bands", () => {
           { id: "GHSA-low", score: "3.9", name: "low-pkg" },
         ]),
         1, // osv-scanner exits 1 when vulns are found — must NOT be treated as an error
+        OSV_WALKED,
       ),
     );
-    const r = await depsRunner.run(ctx());
+    const r = await derive(depsRunner, ctx());
     expect(r.status).toBe("ok");
     const sev = (id: string) => r.findings.find((f) => f.id === `dep-${id}`)?.severity;
     expect(sev("GHSA-crit")).toBe("critical");
@@ -248,7 +268,7 @@ describe("deps.ts — CVSS → severity bands", () => {
         1,
       ),
     );
-    const r = await depsRunner.run(ctx());
+    const r = await derive(depsRunner, ctx());
     const sev = (id: string) => r.findings.find((f) => f.id === `dep-${id}`)?.severity;
     expect(sev("GHSA-a")).toBe("high");
     expect(sev("GHSA-b")).toBe("medium");
@@ -257,7 +277,7 @@ describe("deps.ts — CVSS → severity bands", () => {
 
   it("defaults a vulnerability with no CVSS score to medium — never drops it", async () => {
     dockerRunMock.mockResolvedValue(ok(osvOutput([{ id: "GHSA-noscore", name: "x" }]), 1));
-    const r = await depsRunner.run(ctx());
+    const r = await derive(depsRunner, ctx());
     const f = r.findings.find((x) => x.id === "dep-GHSA-noscore")!;
     expect(f).toBeDefined();
     expect(f.severity).toBe("medium");
@@ -267,16 +287,24 @@ describe("deps.ts — CVSS → severity bands", () => {
     dockerRunMock.mockResolvedValue(
       ok(osvOutput([{ id: "GHSA-vec", score: "9.8", name: "v" }]), 1),
     );
-    const r = await depsRunner.run(ctx());
+    const r = await derive(depsRunner, ctx());
     expect(r.findings.find((f) => f.id === "dep-GHSA-vec")?.severity).toBe("critical");
   });
 
-  it("reports a clean scan as a single info finding", async () => {
-    dockerRunMock.mockResolvedValue(ok(JSON.stringify({ results: [] }), 0));
-    const r = await depsRunner.run(ctx());
-    expect(r.findings).toEqual([
-      expect.objectContaining({ id: "deps-ok", severity: "info" }),
-    ]);
+  it("reports a clean scan as clean — no findings, with the manifests it walked on record", async () => {
+    dockerRunMock.mockResolvedValue(ok(JSON.stringify({ results: [] }), 0, OSV_WALKED));
+    const r = await derive(depsRunner, ctx());
+    expect(r.status).toBe("ok");
+    expect(r.findings).toEqual([]);
+    expect(r.coverage?.data.sources).toBe(1);
+    expect(r.coverage?.data.packages).toBe(304);
+  });
+
+  it("REFUSES a scan that walked no manifest at all — a gitignored lockfile silently removes a whole ecosystem, and the tool still exits reporting nothing", async () => {
+    dockerRunMock.mockResolvedValue(ok(JSON.stringify({ results: [] }), 0, "No package sources found\n"));
+    const r = await derive(depsRunner, ctx());
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/no lockfiles or manifests were walked/i);
   });
 
   it("errors on a real scanner failure (exit > 1, no JSON) instead of reporting clean", async () => {
@@ -286,7 +314,7 @@ describe("deps.ts — CVSS → severity bands", () => {
       stderr: "image not found",
       timedOut: false,
     });
-    const r = await depsRunner.run(ctx());
+    const r = await derive(depsRunner, ctx());
     expect(r.status).toBe("error");
     expect(r.findings).toEqual([]);
   });
@@ -307,7 +335,7 @@ describe("sast.ts — semgrep severity mapping", () => {
         }),
       ),
     );
-    const r = await sastRunner.run(ctx());
+    const r = await derive(sastRunner, ctx());
     const sev = (id: string) => r.findings.find((f) => f.id === `sast-${id}`)?.severity;
     expect(sev("rule.err")).toBe("high");
     expect(sev("rule.warn")).toBe("medium");
@@ -324,14 +352,14 @@ describe("sast.ts — semgrep severity mapping", () => {
         }),
       ),
     );
-    const r = await sastRunner.run(ctx());
+    const r = await derive(sastRunner, ctx());
     expect(r.findings.find((f) => f.id === "sast-rule.weird")?.severity).toBe("low");
   });
 
   it("de-dupes identical rule+file+line hits", async () => {
     const hit = { check_id: "rule.x", path: "/src/a.ts", start: { line: 1 }, extra: { severity: "ERROR", message: "bad" } };
     dockerRunMock.mockResolvedValue(ok(JSON.stringify({ results: [hit, hit] })));
-    const r = await sastRunner.run(ctx());
+    const r = await derive(sastRunner, ctx());
     expect(r.findings.filter((f) => f.id === "sast-rule.x")).toHaveLength(1);
   });
 
@@ -345,7 +373,7 @@ describe("sast.ts — semgrep severity mapping", () => {
         }),
       ),
     );
-    const r = await sastRunner.run(ctx());
+    const r = await derive(sastRunner, ctx());
     expect(r.findings.find((f) => f.id === "sast-rule.x")?.location).toBe("deep/a.ts:7");
   });
 
@@ -356,7 +384,7 @@ describe("sast.ts — semgrep severity mapping", () => {
       stderr: "died",
       timedOut: false,
     });
-    const r = await sastRunner.run(ctx());
+    const r = await derive(sastRunner, ctx());
     expect(r.status).toBe("error");
     expect(r.findings).toEqual([]);
   });
@@ -383,7 +411,7 @@ describe("sast.ts — semgrep severity mapping", () => {
       stderr: "semgrep: fatal error",
       timedOut: false,
     });
-    const r = await sastRunner.run(ctx());
+    const r = await derive(sastRunner, ctx());
     expect(r.status).toBe("error");
     expect(r.findings.find((f) => f.id === "sast-ok")).toBeUndefined();
   });
@@ -401,7 +429,7 @@ describe("secrets.ts — gitleaks parsing", () => {
         ]),
       ),
     );
-    const r = await secretsRunner.run(ctx());
+    const r = await derive(secretsRunner, ctx());
     const leaks = r.findings.filter((f) => f.severity !== "info");
     expect(leaks).toHaveLength(2);
     expect(leaks.every((f) => f.severity === "critical")).toBe(true);
@@ -413,29 +441,29 @@ describe("secrets.ts — gitleaks parsing", () => {
     dockerRunMock.mockResolvedValue(
       ok(JSON.stringify([{ ...leak, Commit: "aaa" }, { ...leak, Commit: "bbb" }])),
     );
-    const r = await secretsRunner.run(ctx());
+    const r = await derive(secretsRunner, ctx());
     expect(r.findings.filter((f) => f.severity === "critical")).toHaveLength(1);
   });
 
-  it("reports a clean repo as a single info finding with a zero leak count", async () => {
-    dockerRunMock.mockResolvedValue(ok("[]"));
-    const r = await secretsRunner.run(ctx());
-    expect(r.findings).toEqual([
-      expect.objectContaining({ id: "secrets-ok", severity: "info" }),
-    ]);
+  it("reports a clean repo as clean — gitleaks writes NOTHING to the report path when it finds nothing", async () => {
+    dockerRunMock.mockResolvedValue(ok("", 0, GITLEAKS_SCANNED));
+    const r = await derive(secretsRunner, ctx());
+    expect(r.status).toBe("ok");
+    expect(r.findings).toEqual([]);
     expect(r.meta?.leakCount).toBe(0);
+    expect(r.coverage?.data.commits).toBe(14);
   });
 });
 
 // ── zap.ts ────────────────────────────────────────────────────────────────────
 
 /** zap.ts reads report.json out of the host dir it bind-mounts at /zap/wrk. */
-function zapWritesReport(alerts: unknown[]) {
+function zapWritesReport(alerts: unknown[], stdout: string = ZAP_CRAWLED) {
   dockerRunMock.mockImplementation(async (opts: { mountsRW?: Record<string, string> }) => {
     const dir = opts.mountsRW?.["/zap/wrk"]!;
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "report.json"), JSON.stringify({ site: [{ alerts }] }));
-    return ok("");
+    return ok(stdout);
   });
 }
 
@@ -447,7 +475,7 @@ describe("zap.ts — riskcode mapping", () => {
       { alert: "Cookie no HttpOnly", riskcode: "1", desc: "d", solution: "s", instances: [{ uri: "u" }] },
       { alert: "Informational thing", riskcode: "0", desc: "d", solution: "s", instances: [{ uri: "u" }] },
     ]);
-    const r = await zapRunner.run(ctx());
+    const r = await derive(zapRunner, ctx());
     const sevOf = (title: string) =>
       r.findings.find((f) => f.title.startsWith(title))?.severity;
     expect(sevOf("SQL Injection")).toBe("high");
@@ -461,7 +489,7 @@ describe("zap.ts — riskcode mapping", () => {
       { alert: "Missing CSP", riskcode: "2", instances: [{ uri: "u1" }] },
       { alert: "Missing CSP", riskcode: "2", instances: [{ uri: "u2" }] },
     ]);
-    const r = await zapRunner.run(ctx());
+    const r = await derive(zapRunner, ctx());
     expect(r.findings.filter((f) => f.severity !== "info")).toHaveLength(1);
   });
 
@@ -475,7 +503,7 @@ describe("zap.ts — riskcode mapping", () => {
         instances: [{ uri: "u" }],
       },
     ]);
-    const r = await zapRunner.run(ctx());
+    const r = await derive(zapRunner, ctx());
     const f = r.findings.find((x) => x.severity === "medium")!;
     expect(f.remediation).not.toMatch(/<[^>]+>/);
     expect(f.evidence).not.toMatch(/<[^>]+>/);
@@ -483,7 +511,7 @@ describe("zap.ts — riskcode mapping", () => {
 
   it("runs the passive baseline (never the active full-scan) against a remote target", async () => {
     zapWritesReport([]);
-    const r = await zapRunner.run(ctx({ baseUrl: "https://example.com" }));
+    const r = await derive(zapRunner, ctx({ baseUrl: "https://example.com" }));
     const args = dockerRunMock.mock.calls[0]![0].args as string[];
     expect(args[0]).toBe("zap-baseline.py");
     expect(r.note).toMatch(/passive baseline/);
@@ -494,7 +522,7 @@ describe("zap.ts — riskcode mapping", () => {
     const c = ctx({ baseUrl: "http://localhost:3000" });
     c.run.isLocalhost = true;
     c.run.allowActive = true;
-    const r = await zapRunner.run(c);
+    const r = await derive(zapRunner, c);
     const args = dockerRunMock.mock.calls[0]![0].args as string[];
     expect(args[0]).toBe("zap-full-scan.py");
     expect(r.note).toMatch(/active full-scan/);
@@ -505,14 +533,14 @@ describe("zap.ts — riskcode mapping", () => {
     const c = ctx({ baseUrl: "http://localhost:3000" });
     c.run.isLocalhost = true;
     c.run.allowActive = false;
-    await zapRunner.run(c);
+    await derive(zapRunner, c);
     const args = dockerRunMock.mock.calls[0]![0].args as string[];
     expect(args[0]).toBe("zap-baseline.py");
   });
 
   it("errors when ZAP produces no report", async () => {
     dockerRunMock.mockResolvedValue(ok(""));
-    const r = await zapRunner.run(ctx());
+    const r = await derive(zapRunner, ctx());
     expect(r.status).toBe("error");
   });
 });
@@ -540,7 +568,7 @@ describe("tlsRunner — endpoint pinning on multi-IP hosts (bug #7)", () => {
   it("pins ONE deterministic endpoint — the lowest address in sorted order, not 'whatever DNS said first'", async () => {
     resolvedIps = ["104.21.90.166", "172.67.158.51"];
     tlsWrites([]);
-    await tlsRunner.run(ctx());
+    await derive(tlsRunner, ctx());
 
     const args = (dockerRunMock.mock.calls[0]![0] as { args: string[] }).args;
     const ip = args[args.indexOf("--ip") + 1];
@@ -552,7 +580,7 @@ describe("tlsRunner — endpoint pinning on multi-IP hosts (bug #7)", () => {
   it("picks the same endpoint no matter what order DNS returns the addresses in", async () => {
     resolvedIps = ["172.67.158.51", "104.21.90.166"]; // reversed
     tlsWrites([]);
-    await tlsRunner.run(ctx());
+    await derive(tlsRunner, ctx());
     const args = (dockerRunMock.mock.calls[0]![0] as { args: string[] }).args;
     expect(args[args.indexOf("--ip") + 1]).toBe("104.21.90.166");
   });
@@ -560,7 +588,7 @@ describe("tlsRunner — endpoint pinning on multi-IP hosts (bug #7)", () => {
   it("states its own coverage on a multi-endpoint host rather than implying it scanned everything", async () => {
     resolvedIps = ["104.21.90.166", "172.67.158.51"];
     tlsWrites([]);
-    const r = await tlsRunner.run(ctx());
+    const r = await derive(tlsRunner, ctx());
 
     const coverage = r.findings.find((f) => f.id === "tls-endpoint-coverage")!;
     expect(coverage).toBeDefined();
@@ -570,10 +598,12 @@ describe("tlsRunner — endpoint pinning on multi-IP hosts (bug #7)", () => {
     expect(r.meta).toMatchObject({ endpointsResolved: 2, endpointScanned: "104.21.90.166" });
   });
 
-  it("says nothing about coverage on an ordinary single-endpoint host — no noise", async () => {
+  it("says nothing about endpoint coverage on an ordinary single-endpoint host — no noise", async () => {
     resolvedIps = ["93.184.216.34"];
-    tlsWrites([]);
-    const r = await tlsRunner.run(ctx());
+    // testssl always emits a record per test it ran, OK ones included — an
+    // empty array would mean it never reached the host.
+    tlsWrites([{ id: "TLS1_3", severity: "OK", finding: "offered" }]);
+    const r = await derive(tlsRunner, ctx());
     expect(r.findings.find((f) => f.id === "tls-endpoint-coverage")).toBeUndefined();
     expect(r.note).toBeUndefined();
   });
@@ -585,7 +615,7 @@ describe("tlsRunner — endpoint pinning on multi-IP hosts (bug #7)", () => {
       { id: "BREACH", severity: "MEDIUM", finding: "potentially VULNERABLE" },
       { id: "BREACH", severity: "MEDIUM", finding: "potentially VULNERABLE" },
     ]);
-    const r = await tlsRunner.run(ctx());
+    const r = await derive(tlsRunner, ctx());
     expect(r.findings.filter((f) => f.id === "tls-BREACH")).toHaveLength(1);
   });
 });
@@ -601,7 +631,7 @@ describe("zapRunner — refuses to scan a target that isn't the site", () => {
     };
     dockerRunMock.mockResolvedValue(ok(""));
 
-    const r = await zapRunner.run(ctx({ baseUrl: "https://ds.example.com" }));
+    const r = await derive(zapRunner, ctx({ baseUrl: "https://ds.example.com" }));
 
     expect(r.status).toBe("error");
     expect(r.note).toMatch(/auth gate/);
@@ -614,10 +644,89 @@ describe("zapRunner — refuses to scan a target that isn't the site", () => {
     probeResult = { ok: false, note: "refusing to score — HTTP 429 — could not fetch the real page" };
     dockerRunMock.mockResolvedValue(ok(""));
 
-    const r = await zapRunner.run(ctx());
+    const r = await derive(zapRunner, ctx());
 
     expect(r.status).toBe("error");
     expect(r.note).toMatch(/429/);
     expect(dockerRunMock).not.toHaveBeenCalled();
+  });
+});
+
+// ── The coverage holes (42L-1003) ────────────────────────────────────────────
+//
+// Every one of these is a scan that ran, exited 0, reported nothing, and was
+// read as a clean bill of health. None of them examined anything. They are the
+// reason "clean" is no longer something a runner is allowed to claim: it has to
+// be derived from what the tool can prove it looked at.
+//
+// The tool outputs below are real — captured from the actual container images,
+// not invented — because a fixture that guesses at the shape is exactly how the
+// bug survived the last round of tests.
+
+describe("a scan that examined nothing is never a clean scan", () => {
+  it("secrets: gitleaks pointed at a directory that is not a git repo scans 0 commits, says 'no leaks found', and exits 0 — REFUSE", async () => {
+    dockerRunMock.mockResolvedValue(
+      ok("", 0, "0 commits scanned.\nscanned ~0 bytes (0) in 25.4ms\nno leaks found\n"),
+    );
+    const r = await derive(secretsRunner, ctx());
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/0 commits/i);
+    expect(r.note).toMatch(/not a git repository/i);
+  });
+
+  it("secrets: a repo whose history was read is clean, and says how much it read", async () => {
+    dockerRunMock.mockResolvedValue(ok("", 0, GITLEAKS_SCANNED));
+    const r = await derive(secretsRunner, ctx());
+    expect(r.status).toBe("ok");
+    expect(r.coverage?.data.commits).toBe(14);
+    expect(r.coverage?.data.bytes).toBe(554058);
+  });
+
+  it("sast: semgrep with no source it understands scans 0 files, returns results:[], exits 0 — REFUSE", async () => {
+    dockerRunMock.mockResolvedValue(
+      ok(JSON.stringify({ results: [], errors: [], paths: { scanned: [] } })),
+    );
+    const r = await derive(sastRunner, ctx());
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/scanned 0 files/i);
+  });
+
+  it("sast: a repo semgrep actually read is clean, and says how many files it read", async () => {
+    dockerRunMock.mockResolvedValue(
+      ok(
+        JSON.stringify({
+          results: [],
+          errors: [],
+          paths: { scanned: ["/src/a.ts", "/src/b.ts"] },
+        }),
+      ),
+    );
+    const r = await derive(sastRunner, ctx());
+    expect(r.status).toBe("ok");
+    expect(r.findings).toEqual([]);
+    expect(r.coverage?.data.filesScanned).toBe(2);
+  });
+
+  it("zap: a spider that reached 0 URLs found no alerts because it never entered the app — REFUSE", async () => {
+    zapWritesReport([], "FAIL-NEW: 0\tFAIL-INPROG: 0\tWARN-NEW: 0\tWARN-INPROG: 0\tINFO: 0\tIGNORE: 0\tPASS: 58\n");
+    const r = await derive(zapRunner, ctx());
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/spider reached 0 URLs/i);
+  });
+
+  it("zap: a scan that crawled the app is clean, and says how far it got", async () => {
+    zapWritesReport([]);
+    const r = await derive(zapRunner, ctx());
+    expect(r.status).toBe("ok");
+    expect(r.findings).toEqual([]);
+    expect(r.coverage?.data.urlsSpidered).toBe(12);
+    expect(r.coverage?.data.rulesRun).toBe(61);
+  });
+
+  it("tls: testssl that performed no tests never reached the host — REFUSE", async () => {
+    tlsWritesJson([]);
+    const r = await derive(tlsRunner, ctx());
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/performed no tests/i);
   });
 });

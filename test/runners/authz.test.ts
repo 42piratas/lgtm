@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { derive } from "../../src/scoring.js";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -99,13 +100,13 @@ function ctx(routes: string[], authPath: string | null = statePath): RunnerConte
 
 describe("authz.ts — preconditions", () => {
   it("skips visibly when the site has no authenticated session configured", async () => {
-    const r = await authzRunner.run(ctx(["/dashboard"], null));
+    const r = await derive(authzRunner, ctx(["/dashboard"], null));
     expect(r.status).toBe("skipped");
     expect(r.note).toMatch(/no authenticated session/i);
   });
 
   it("skips visibly when the storageState file is missing from disk", async () => {
-    const r = await authzRunner.run(ctx(["/dashboard"], join(dir, "nope.json")));
+    const r = await derive(authzRunner, ctx(["/dashboard"], join(dir, "nope.json")));
     expect(r.status).toBe("skipped");
     expect(r.note).toMatch(/storageState file missing/i);
   });
@@ -117,7 +118,7 @@ describe("authz.ts — anonymous access to protected routes (OWASP A01)", () => 
   it("flags HIGH when a protected route serves 200 anonymously with no login redirect", async () => {
     authedNav[dash] = { landed: dash, status: 200, headers: { "cache-control": "no-store" } };
     anonNav[dash] = { landed: dash, status: 200 }; // wide open
-    const r = await authzRunner.run(ctx(["/dashboard"]));
+    const r = await derive(authzRunner, ctx(["/dashboard"]));
     const f = r.findings.find((x) => x.id === `authz-open-${dash}`)!;
     expect(f).toBeDefined();
     expect(f.severity).toBe("high");
@@ -127,21 +128,21 @@ describe("authz.ts — anonymous access to protected routes (OWASP A01)", () => 
   it("does NOT flag when anonymous access is refused with 401", async () => {
     authedNav[dash] = { landed: dash, status: 200, headers: { "cache-control": "no-store" } };
     anonNav[dash] = { landed: dash, status: 401 };
-    const r = await authzRunner.run(ctx(["/dashboard"]));
+    const r = await derive(authzRunner, ctx(["/dashboard"]));
     expect(r.findings.find((x) => x.id.startsWith("authz-open-"))).toBeUndefined();
   });
 
   it("does NOT flag when anonymous access is refused with 403", async () => {
     authedNav[dash] = { landed: dash, status: 200, headers: { "cache-control": "no-store" } };
     anonNav[dash] = { landed: dash, status: 403 };
-    const r = await authzRunner.run(ctx(["/dashboard"]));
+    const r = await derive(authzRunner, ctx(["/dashboard"]));
     expect(r.findings.find((x) => x.id.startsWith("authz-open-"))).toBeUndefined();
   });
 
   it("does NOT flag when anonymous access is redirected to a login page (LOGIN_HINT)", async () => {
     authedNav[dash] = { landed: dash, status: 200, headers: { "cache-control": "no-store" } };
     anonNav[dash] = { landed: "https://example.com/login?next=/dashboard", status: 200 };
-    const r = await authzRunner.run(ctx(["/dashboard"]));
+    const r = await derive(authzRunner, ctx(["/dashboard"]));
     expect(r.findings.find((x) => x.id.startsWith("authz-open-"))).toBeUndefined();
   });
 
@@ -154,7 +155,7 @@ describe("authz.ts — anonymous access to protected routes (OWASP A01)", () => 
   ])("treats a redirect to %s as a login bounce (LOGIN_HINT covers %s)", async (landed) => {
     authedNav[dash] = { landed: dash, status: 200, headers: { "cache-control": "no-store" } };
     anonNav[dash] = { landed, status: 200 };
-    const r = await authzRunner.run(ctx(["/dashboard"]));
+    const r = await derive(authzRunner, ctx(["/dashboard"]));
     expect(r.findings.find((x) => x.id.startsWith("authz-open-"))).toBeUndefined();
   });
 });
@@ -165,7 +166,7 @@ describe("authz.ts — authed-session health and response cacheability", () => {
   it("flags a cacheable authenticated response (no no-store)", async () => {
     authedNav[dash] = { landed: dash, status: 200, headers: { "cache-control": "max-age=3600" } };
     anonNav[dash] = { landed: dash, status: 401 };
-    const r = await authzRunner.run(ctx(["/dashboard"]));
+    const r = await derive(authzRunner, ctx(["/dashboard"]));
     const f = r.findings.find((x) => x.id === `authz-cache-${dash}`)!;
     expect(f).toBeDefined();
     expect(f.severity).toBe("low");
@@ -175,14 +176,14 @@ describe("authz.ts — authed-session health and response cacheability", () => {
   it("flags an authed response with NO cache-control header at all", async () => {
     authedNav[dash] = { landed: dash, status: 200, headers: {} };
     anonNav[dash] = { landed: dash, status: 401 };
-    const r = await authzRunner.run(ctx(["/dashboard"]));
+    const r = await derive(authzRunner, ctx(["/dashboard"]));
     expect(r.findings.find((x) => x.id === `authz-cache-${dash}`)!.title).toMatch(/unset/);
   });
 
   it("does NOT flag cacheability when the authed response sends no-store", async () => {
     authedNav[dash] = { landed: dash, status: 200, headers: { "cache-control": "no-store" } };
     anonNav[dash] = { landed: dash, status: 401 };
-    const r = await authzRunner.run(ctx(["/dashboard"]));
+    const r = await derive(authzRunner, ctx(["/dashboard"]));
     expect(r.findings.find((x) => x.id.startsWith("authz-cache-"))).toBeUndefined();
   });
 
@@ -191,24 +192,30 @@ describe("authz.ts — authed-session health and response cacheability", () => {
     // trusted, and the runner must SAY so rather than quietly reporting clean.
     authedNav[dash] = { landed: "https://example.com/login", status: 200 };
     anonNav[dash] = { landed: "https://example.com/login", status: 200 };
-    const r = await authzRunner.run(ctx(["/dashboard"]));
+    const r = await derive(authzRunner, ctx(["/dashboard"]));
     expect(r.findings.find((x) => x.id === "authz-session-bounce")).toBeDefined();
     expect(r.findings.find((x) => x.id === "authz-session-dead")).toBeDefined();
     expect(r.meta?.sessionWorks).toBe(false);
   });
 
-  it("notes when no protected routes are configured — there is nothing to prove", async () => {
-    const r = await authzRunner.run(ctx([]));
-    expect(r.findings.find((x) => x.id === "authz-no-routes")).toBeDefined();
+  it("refuses when no protected routes are configured — probing nothing proves nothing", async () => {
+    // The old runner emitted an info note and then went on to declare
+    // "Protected routes enforce auth" — a claim about routes, on a run that
+    // probed none. There is no evidence here, so there is no verdict.
+    const r = await derive(authzRunner, ctx([]));
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/no protected routes are configured/i);
+    expect(r.coverage?.data.routesProbed).toBe(0);
   });
 
-  it("reports a healthy, properly-guarded app as clean", async () => {
+  it("reports a healthy, properly-guarded app as clean, with the routes it probed on record", async () => {
     authedNav[dash] = { landed: dash, status: 200, headers: { "cache-control": "no-store" } };
     anonNav[dash] = { landed: dash, status: 401 };
-    const r = await authzRunner.run(ctx(["/dashboard"]));
+    const r = await derive(authzRunner, ctx(["/dashboard"]));
     expect(r.status).toBe("ok");
     expect(r.findings.filter((f) => f.severity !== "info")).toEqual([]);
-    expect(r.findings.find((f) => f.id === "authz-ok")).toBeDefined();
+    expect(r.coverage?.data.routesProbed).toBe(1);
+    expect(r.coverage?.data.probesFailed).toBe(0);
     expect(r.meta?.sessionWorks).toBe(true);
   });
 });
@@ -227,7 +234,7 @@ describe("authz.ts — authed-session health and response cacheability", () => {
 // safe; it is unknown, and unknown has to fail the run.
 
 describe("authzRunner — a route that could not be loaded was NOT verified", () => {
-  it("never claims authz-ok when the anonymous probe failed to load the route", async () => {
+  it("never reports clean when the anonymous probe failed to load the route", async () => {
     anonNav = {
       "https://example.com/dashboard": {
         landed: "",
@@ -235,13 +242,17 @@ describe("authzRunner — a route that could not be loaded was NOT verified", ()
         throws: "page.goto: Timeout 30000ms exceeded",
       },
     };
-    const r = await authzRunner.run(ctx(["/dashboard"]));
+    const r = await derive(authzRunner, ctx(["/dashboard"]));
 
-    // The bug: this used to be "ok" + authz-ok, i.e. a clean bill of health.
+    // The bug: this used to be "ok" + a self-declared pass-note, i.e. a clean
+    // bill of health for a route nobody managed to load.
     expect(r.status).toBe("error");
-    expect(r.findings.find((f) => f.id === "authz-ok")).toBeUndefined();
-    expect(r.note).toMatch(/could not verify access control/i);
-    expect(r.note).toMatch(/unknown, not absent/i);
+    expect(r.note).toMatch(/never landed/i);
+    expect(r.note).toMatch(/not verified/i);
+    // And the route it could not check is still named in the findings.
+    expect(
+      r.findings.find((f) => f.id.startsWith("authz-unchecked")),
+    ).toBeDefined();
   });
 
   it("emits a visible, reviewable finding naming the route it could not check", async () => {
@@ -252,7 +263,7 @@ describe("authzRunner — a route that could not be loaded was NOT verified", ()
         throws: "net::ERR_CONNECTION_RESET",
       },
     };
-    const r = await authzRunner.run(ctx(["/dashboard"]));
+    const r = await derive(authzRunner, ctx(["/dashboard"]));
 
     const unchecked = r.findings.find((f) => f.id.startsWith("authz-unchecked"))!;
     expect(unchecked).toBeDefined();
@@ -270,9 +281,9 @@ describe("authzRunner — a route that could not be loaded was NOT verified", ()
         throws: "page.goto: Timeout 30000ms exceeded",
       },
     };
-    const r = await authzRunner.run(ctx(["/dashboard"]));
+    const r = await derive(authzRunner, ctx(["/dashboard"]));
     expect(r.status).toBe("error");
-    expect(r.findings.find((f) => f.id === "authz-ok")).toBeUndefined();
+    expect(r.status).toBe("error");
   });
 
   it("still reports a genuinely open route found alongside one it could not check — a nav failure removes certainty, it does not erase evidence", async () => {
@@ -282,7 +293,7 @@ describe("authzRunner — a route that could not be loaded was NOT verified", ()
       // Unreachable: unknown.
       "https://example.com/billing": { landed: "", status: 0, throws: "Timeout" },
     };
-    const r = await authzRunner.run(ctx(["/admin", "/billing"]));
+    const r = await derive(authzRunner, ctx(["/admin", "/billing"]));
 
     const open = r.findings.find((f) => f.id.startsWith("authz-open"))!;
     expect(open).toBeDefined();
@@ -307,9 +318,9 @@ describe("authzRunner — a route that could not be loaded was NOT verified", ()
         status: 200,
       },
     };
-    const r = await authzRunner.run(ctx(["/dashboard"]));
+    const r = await derive(authzRunner, ctx(["/dashboard"]));
     expect(r.status).toBe("ok");
-    expect(r.findings.find((f) => f.id === "authz-ok")).toBeDefined();
+    expect(r.coverage?.data.probesFailed).toBe(0);
     expect(r.findings.some((f) => f.id.startsWith("authz-unchecked"))).toBe(false);
   });
 });

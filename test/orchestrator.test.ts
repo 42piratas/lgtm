@@ -1,21 +1,33 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Runner, RunnerContext, RunnerResult, SiteConfig } from "../src/types.js";
+import type {
+  Coverage,
+  Domain,
+  Runner,
+  RunnerOutcome,
+  SiteConfig,
+} from "../src/types.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-// The orchestrator's gate() decides which runners actually execute. Every
-// bug class in this ticket that isn't a pure-scoring bug traces back to a
-// runner running when it shouldn't (or silently not running at all):
-//   - white-box runners need repoPath — skip must be visible, not a silent
-//     empty "clean" result an operator mistakes for a pass.
-//   - docker-hosted scanners must not crash the whole audit when Docker is
-//     down; they must report a legible skip.
-//   - localhost-only (active/mutating) runners must never fire at a remote
-//     target.
-// These are tested through the real orchestrator against fake runners, so
-// gate()'s actual decision logic is exercised — not a re-description of it.
+// The orchestrator is where a scan becomes a VERDICT. Everything that decides
+// whether lgtm may call a domain clean lives here:
+//
+//   gate()      — which runners are even allowed to run, and what it means when
+//                 one cannot: a domain that does not apply (no TLS on an http
+//                 dev server) is not the same as a domain nobody audited (no
+//                 Docker, no repo checkout). The first is fine; the second is a
+//                 coverage hole and must fail the run.
+//   derive()    — turns an observation into a status by asking the runner's own
+//                 sufficient() rule whether the evidence supports a conclusion.
+//                 A runner cannot set its own status: RunnerOutcome has no
+//                 status field. That is the whole point of the contract.
+//   complete    — a run that never audited half its domains cannot pass, no
+//                 matter how few findings it has.
+//
+// Tested through the real orchestrator against fake runners, so the actual
+// decision logic is exercised rather than re-described.
 
 vi.mock("../src/util/docker.js", () => ({
   hasDocker: vi.fn(),
@@ -44,189 +56,258 @@ function baseSite(overrides: Partial<SiteConfig> = {}): SiteConfig {
   };
 }
 
-function okRunner(id: string, run: Runner["run"]): Runner {
-  return { id, domain: "security", title: id, requires: {}, run };
+/** Coverage that any sufficiency rule would accept — "we really did look". */
+const LOOKED: Coverage = {
+  trail: ["looked at the thing"],
+  data: { looked: 1 },
+  provenance: "test",
+};
+
+/**
+ * A fake runner. `sufficient` defaults to permissive so a test can isolate the
+ * gate; tests about evidence supply their own.
+ */
+function fake(
+  id: string,
+  observe: Runner["observe"],
+  opts: {
+    requires?: Runner["requires"];
+    domain?: Domain;
+    sufficient?: Runner["sufficient"];
+  } = {},
+): Runner {
+  return {
+    id,
+    domain: opts.domain ?? "security",
+    title: id,
+    requires: opts.requires ?? {},
+    observe,
+    sufficient: opts.sufficient ?? (() => null),
+  };
+}
+
+/** The ordinary "ran, saw nothing wrong, and can prove it looked" outcome. */
+const cleanObserve = async (): Promise<RunnerOutcome> => ({
+  kind: "observed",
+  findings: [],
+  coverage: LOOKED,
+});
+
+async function audit(opts: {
+  site?: SiteConfig;
+  baseUrl?: string;
+  allowActive?: boolean;
+  only?: string[];
+  log?: (m: string) => void;
+}) {
+  const site = opts.site ?? baseSite();
+  return runAudit({
+    site,
+    baseUrl: opts.baseUrl ?? site.baseUrl,
+    outDir: "/tmp/unused",
+    stamp: "x",
+    allowActive: opts.allowActive ?? false,
+    only: opts.only,
+    log: opts.log,
+  });
 }
 
 beforeEach(() => {
   fakeRunners = [];
   vi.mocked(hasDocker).mockReset();
+  vi.mocked(hasDocker).mockResolvedValue(true);
 });
 
 describe("gate — white-box runners without a repo checkout", () => {
-  it("skips visibly (not silently) when repoPath is not configured", async () => {
-    const run = vi.fn();
-    fakeRunners = [
-      { id: "deps", domain: "deps", title: "deps", requires: { repo: true }, run },
-    ];
+  it("skips visibly (not silently) when repoPath is not configured, and FAILS the run — that domain went unaudited", async () => {
+    const observe = vi.fn();
+    fakeRunners = [fake("deps", observe, { requires: { repo: true }, domain: "deps" })];
     const logs: string[] = [];
-    const report = await runAudit({
-      site: baseSite(), // no repoPath
-      baseUrl: "https://example.com",
-      outDir: "/tmp/unused",
-      stamp: "x",
-      allowActive: false,
-      log: (m) => logs.push(m),
-    });
+    const report = await audit({ log: (m) => logs.push(m) }); // no repoPath
 
-    expect(run).not.toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
     const r = report.results.find((x) => x.runnerId === "deps")!;
     expect(r.status).toBe("skipped");
     expect(r.note).toMatch(/no repoPath configured/i);
-    // Visible: the skip is surfaced through the log callback an operator sees.
+    // Visible: surfaced through the log callback an operator sees…
     expect(logs.some((l) => l.includes("deps") && /skip/i.test(l))).toBe(true);
+    // …and consequential. Nobody scanned the dependencies; the run cannot pass.
+    expect(report.complete).toBe(false);
+    expect(report.passed).toBe(false);
+    expect(report.notAudited).toContainEqual(
+      expect.objectContaining({ runnerId: "deps", waived: false }),
+    );
   });
 
   it("skips when repoPath is configured but doesn't exist on disk", async () => {
-    const run = vi.fn();
+    const observe = vi.fn();
     fakeRunners = [
-      { id: "secrets", domain: "secrets", title: "secrets", requires: { repo: true }, run },
+      fake("secrets", observe, { requires: { repo: true }, domain: "secrets" }),
     ];
-    const report = await runAudit({
+    const report = await audit({
       site: baseSite({ repoPath: "/definitely/not/a/real/path/on/this/box" }),
-      baseUrl: "https://example.com",
-      outDir: "/tmp/unused",
-      stamp: "x",
-      allowActive: false,
     });
-    expect(run).not.toHaveBeenCalled();
+    expect(observe).not.toHaveBeenCalled();
     const r = report.results.find((x) => x.runnerId === "secrets")!;
     expect(r.status).toBe("skipped");
     expect(r.note).toMatch(/does not exist/i);
+    expect(report.passed).toBe(false);
   });
 
   it("runs a white-box runner once repoPath exists (using this test file's own directory as a stand-in repo)", async () => {
-    const run = vi.fn(async (ctx: RunnerContext): Promise<RunnerResult> => ({
-      runnerId: "secrets",
-      domain: "secrets",
-      status: "ok",
-      findings: [],
-      durationMs: 1,
-    }));
+    const observe = vi.fn(cleanObserve);
     fakeRunners = [
-      { id: "secrets", domain: "secrets", title: "secrets", requires: { repo: true }, run },
+      fake("secrets", observe, { requires: { repo: true }, domain: "secrets" }),
     ];
-    await runAudit({
-      site: baseSite({ repoPath: HERE }),
-      baseUrl: "https://example.com",
-      outDir: "/tmp/unused",
-      stamp: "x",
-      allowActive: false,
-    });
-    expect(run).toHaveBeenCalledTimes(1);
+    const report = await audit({ site: baseSite({ repoPath: HERE }) });
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(report.passed).toBe(true);
   });
 });
 
-describe("gate — localhost-only runners", () => {
-  it("skips an active/mutating runner against a remote target", async () => {
-    const run = vi.fn();
+describe("gate — Docker, declared once and enforced once", () => {
+  it("skips a docker-hosted runner when Docker is down, and FAILS the run — the runner no longer has to check for itself", async () => {
+    vi.mocked(hasDocker).mockResolvedValue(false);
+    const observe = vi.fn();
     fakeRunners = [
-      {
-        id: "zap-active",
-        domain: "dast",
-        title: "zap",
-        requires: { localhostOnly: true },
-        run,
-      },
+      fake("tls", observe, { requires: { docker: true }, domain: "transport" }),
     ];
-    const report = await runAudit({
-      site: baseSite(),
-      baseUrl: "https://example.com", // remote
-      outDir: "/tmp/unused",
-      stamp: "x",
-      allowActive: true, // operator opted in, but target still isn't localhost
-    });
-    expect(run).not.toHaveBeenCalled();
-    const r = report.results.find((x) => x.runnerId === "zap-active")!;
+    const report = await audit({});
+    const r = report.results.find((x) => x.runnerId === "tls")!;
+    expect(observe).not.toHaveBeenCalled();
     expect(r.status).toBe("skipped");
-    expect(r.note).toMatch(/localhost-only/i);
+    expect(r.note).toMatch(/docker unavailable/i);
+    // The old behaviour: `expect(report.passed).toBe(true)` — "a skip must never
+    // itself fail the gate". That was the bug one level up. A skipped scanner
+    // means an unscanned domain, and an unscanned domain is not a clean one.
+    expect(report.passed).toBe(false);
+  });
+});
+
+describe("gate — not applicable is not the same as not audited", () => {
+  it("a localhost-only probe against a remote target is NOT a coverage hole — nothing was missed", async () => {
+    const observe = vi.fn();
+    fakeRunners = [
+      fake("zap-active", observe, { requires: { localhostOnly: true }, domain: "dast" }),
+    ];
+    const report = await audit({ allowActive: true }); // remote target
+    const r = report.results.find((x) => x.runnerId === "zap-active")!;
+    expect(observe).not.toHaveBeenCalled();
+    expect(r.status).toBe("skipped");
+    expect(r.note).toMatch(/only runs against localhost/i);
+    // Excused: an active scan has nothing to say about a target it must not
+    // touch. The run can still pass.
+    expect(report.complete).toBe(true);
+    expect(report.passed).toBe(true);
   });
 
   it("runs a localhost-only runner against a localhost target", async () => {
-    const run = vi.fn(async (): Promise<RunnerResult> => ({
-      runnerId: "zap-active",
-      domain: "dast",
-      status: "ok",
-      findings: [],
-      durationMs: 1,
-    }));
+    const observe = vi.fn(cleanObserve);
     fakeRunners = [
-      {
-        id: "zap-active",
-        domain: "dast",
-        title: "zap",
-        requires: { localhostOnly: true },
-        run,
-      },
+      fake("zap-active", observe, { requires: { localhostOnly: true }, domain: "dast" }),
     ];
-    await runAudit({
+    await audit({
       site: baseSite({ baseUrl: "http://localhost:3000" }),
       baseUrl: "http://localhost:3000",
-      outDir: "/tmp/unused",
-      stamp: "x",
       allowActive: true,
     });
-    expect(run).toHaveBeenCalledTimes(1);
+    expect(observe).toHaveBeenCalledTimes(1);
+  });
+
+  it("a runner that declares itself notApplicable is excused; one that declares itself unavailable is not", async () => {
+    fakeRunners = [
+      fake("no-tls-here", async () => ({
+        kind: "notApplicable",
+        note: "no TLS to inspect (http/localhost target)",
+      })),
+      fake("cant-run", async () => ({
+        kind: "unavailable",
+        note: "auth storageState file missing",
+      })),
+    ];
+    const report = await audit({});
+    const na = report.notAudited.find((n) => n.runnerId === "no-tls-here")!;
+    const hole = report.notAudited.find((n) => n.runnerId === "cant-run")!;
+    expect(na.waived).toBe(true);
+    expect(hole.waived).toBe(false);
+    expect(report.complete).toBe(false);
+    expect(report.passed).toBe(false);
   });
 });
 
-describe("docker-hosted runners: visible skip, not a crash, when Docker is down", () => {
-  it("surfaces a legible skipped result via the orchestrator-resolved capability, instead of throwing", async () => {
-    vi.mocked(hasDocker).mockResolvedValue(false);
-    // Mirrors the real pattern used by tls/deps/secrets/sast/zap: the runner
-    // itself checks capability and returns a skip — gate() does not special
-    // case `requires.docker`, so this must hold at the runner level.
-    const run = vi.fn(async (ctx: RunnerContext): Promise<RunnerResult> => {
-      if (!ctx.caps.docker) {
-        return {
-          runnerId: "tls",
-          domain: "transport",
-          status: "skipped",
-          note: "docker unavailable (testssl.sh image needs it)",
-          findings: [],
-          durationMs: 0,
-        };
-      }
-      throw new Error("should not reach here in this test");
-    });
+describe("derive — the runner reports evidence; the orchestrator reaches the verdict", () => {
+  it("calls the runner's sufficient() with the coverage it reported, and passes when it is satisfied", async () => {
+    const sufficient = vi.fn(() => null);
+    fakeRunners = [fake("headers", cleanObserve, { sufficient })];
+    const report = await audit({});
+    expect(sufficient).toHaveBeenCalledWith(LOOKED, expect.anything());
+    expect(report.results[0]!.status).toBe("ok");
+    expect(report.results[0]!.coverage).toEqual(LOOKED);
+    expect(report.passed).toBe(true);
+  });
+
+  it("REFUSES — status error, not a clean pass — when the evidence is too thin, even with zero findings", async () => {
+    // This is the whole ticket. Under the old contract this runner returned
+    // `status: "ok"` with an empty findings array and the report went green.
     fakeRunners = [
-      { id: "tls", domain: "transport", title: "tls", requires: { docker: true }, run },
+      fake(
+        "deps",
+        async () => ({
+          kind: "observed",
+          findings: [],
+          coverage: { trail: [], data: { sources: 0 }, provenance: "walk log" },
+        }),
+        { sufficient: () => "no lockfiles were walked" },
+      ),
     ];
-    const report = await runAudit({
-      site: baseSite(),
-      baseUrl: "https://example.com",
-      outDir: "/tmp/unused",
-      stamp: "x",
-      allowActive: false,
-    });
-    const r = report.results.find((x) => x.runnerId === "tls")!;
-    expect(r.status).toBe("skipped");
-    expect(r.note).toMatch(/docker unavailable/i);
-    expect(report.passed).toBe(true); // a skip must never itself fail the gate
+    const report = await audit({});
+    const r = report.results[0]!;
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/insufficient evidence — no lockfiles were walked/);
+    expect(r.findings).toEqual([]);
+    expect(report.passed).toBe(false);
+  });
+
+  it("keeps the findings a refused runner DID observe — a nav failure removes certainty, it does not erase evidence", async () => {
+    fakeRunners = [
+      fake(
+        "authz",
+        async () => ({
+          kind: "observed",
+          findings: [
+            { id: "authz-open", title: "route wide open", severity: "high" as const },
+          ],
+          coverage: { trail: [], data: { probesFailed: 1 }, provenance: "probe" },
+        }),
+        { sufficient: () => "1 probe never landed" },
+      ),
+    ];
+    const report = await audit({});
+    const r = report.results[0]!;
+    expect(r.status).toBe("error");
+    expect(r.findings).toHaveLength(1);
+    // And the tallies agree with the section — the report cannot contradict itself.
+    expect(report.totals.high).toBe(1);
+  });
+
+  it("a runner cannot fabricate a pass: sufficient() is consulted even when it reported no findings and no note", async () => {
+    const sufficient = vi.fn(() => "nothing was actually examined");
+    fakeRunners = [fake("sast", cleanObserve, { sufficient })];
+    const report = await audit({});
+    expect(sufficient).toHaveBeenCalledTimes(1);
+    expect(report.results[0]!.status).toBe("error");
   });
 });
 
 describe("runner crashes are caught, not fatal to the whole audit", () => {
   it("turns a thrown error into a status: error result and keeps going", async () => {
     fakeRunners = [
-      okRunner("boom", async () => {
+      fake("boom", async () => {
         throw new Error("kaboom");
       }),
-      okRunner("after", async () => ({
-        runnerId: "after",
-        domain: "security",
-        status: "ok",
-        findings: [],
-        durationMs: 1,
-      })),
+      fake("after", cleanObserve),
     ];
-    const report = await runAudit({
-      site: baseSite(),
-      baseUrl: "https://example.com",
-      outDir: "/tmp/unused",
-      stamp: "x",
-      allowActive: false,
-    });
+    const report = await audit({});
     expect(report.results).toHaveLength(2);
     const boom = report.results.find((r) => r.runnerId === "boom")!;
     expect(boom.status).toBe("error");
@@ -236,68 +317,51 @@ describe("runner crashes are caught, not fatal to the whole audit", () => {
   });
 });
 
-describe("--only and site.skip selection", () => {
-  it("--only runs exclusively the named runners", async () => {
-    const a = vi.fn(async () => ({ runnerId: "a", domain: "security" as const, status: "ok" as const, findings: [], durationMs: 1 }));
-    const b = vi.fn(async () => ({ runnerId: "b", domain: "security" as const, status: "ok" as const, findings: [], durationMs: 1 }));
-    fakeRunners = [okRunner("a", a), okRunner("b", b)];
-    const report = await runAudit({
-      site: baseSite(),
-      baseUrl: "https://example.com",
-      outDir: "/tmp/unused",
-      stamp: "x",
-      allowActive: false,
-      only: ["a"],
-    });
+describe("--only and site.skip — a waiver is a decision, and it stays on the record", () => {
+  it("--only runs exclusively the named runners, and reports the rest as waived rather than dropping them", async () => {
+    const a = vi.fn(cleanObserve);
+    const b = vi.fn(cleanObserve);
+    fakeRunners = [fake("a", a), fake("b", b)];
+    const report = await audit({ only: ["a"] });
     expect(a).toHaveBeenCalled();
     expect(b).not.toHaveBeenCalled();
-    expect(report.results.map((r) => r.runnerId)).toEqual(["a"]);
+    // b is still in the report — silently vanishing from the results is how a
+    // partial run comes to look like a whole one.
+    expect(report.results.map((r) => r.runnerId)).toEqual(["a", "b"]);
+    expect(report.results.find((r) => r.runnerId === "b")!.waived).toBe(true);
+    expect(report.complete).toBe(true);
+    expect(report.passed).toBe(true);
   });
 
-  it("site.skip removes runners from the default (non---only) selection", async () => {
-    const a = vi.fn(async () => ({ runnerId: "a", domain: "security" as const, status: "ok" as const, findings: [], durationMs: 1 }));
-    const b = vi.fn(async () => ({ runnerId: "b", domain: "security" as const, status: "ok" as const, findings: [], durationMs: 1 }));
-    fakeRunners = [okRunner("a", a), okRunner("b", b)];
-    await runAudit({
-      site: baseSite({ skip: ["b"] }),
-      baseUrl: "https://example.com",
-      outDir: "/tmp/unused",
-      stamp: "x",
-      allowActive: false,
-    });
+  it("site.skip removes runners from the default selection, on the record and without failing the run", async () => {
+    const a = vi.fn(cleanObserve);
+    const b = vi.fn(cleanObserve);
+    fakeRunners = [fake("a", a), fake("b", b)];
+    const report = await audit({ site: baseSite({ skip: ["b"] }) });
     expect(a).toHaveBeenCalled();
     expect(b).not.toHaveBeenCalled();
+    expect(report.notAudited).toContainEqual(
+      expect.objectContaining({ runnerId: "b", waived: true }),
+    );
+    expect(report.passed).toBe(true);
   });
 });
 
 describe("AuditReport shape — the contract CI consumes", () => {
   it("wires totals/passed/failOn from the actual results, not independently", async () => {
     fakeRunners = [
-      okRunner("clean", async () => ({
-        runnerId: "clean",
-        domain: "security",
-        status: "ok",
-        findings: [{ id: "ok", title: "ok", severity: "info" }],
-        durationMs: 1,
-      })),
-      okRunner("bad", async () => ({
-        runnerId: "bad",
-        domain: "security",
-        status: "ok",
-        findings: [{ id: "leak", title: "leak", severity: "critical" }],
-        durationMs: 1,
+      fake("clean", cleanObserve),
+      fake("bad", async () => ({
+        kind: "observed",
+        findings: [{ id: "leak", title: "leak", severity: "critical" as const }],
+        coverage: LOOKED,
       })),
     ];
-    const report = await runAudit({
-      site: baseSite({ failOn: "high" }),
-      baseUrl: "https://example.com",
-      outDir: "/tmp/unused",
-      stamp: "x",
-      allowActive: false,
-    });
-    expect(report.totals).toEqual({ critical: 1, high: 0, medium: 0, low: 0, info: 1 });
+    const report = await audit({ site: baseSite({ failOn: "high" }) });
+    expect(report.totals).toEqual({ critical: 1, high: 0, medium: 0, low: 0, info: 0 });
     expect(report.failOn).toBe("high");
     expect(report.passed).toBe(false);
+    expect(report.complete).toBe(true); // both ran — the failure is findings, not coverage
     expect(report.site).toBe("site");
     expect(report.results).toHaveLength(2);
   });

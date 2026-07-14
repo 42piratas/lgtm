@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { derive } from "../../src/scoring.js";
 import type { RunnerContext, SiteConfig } from "../../src/types.js";
 
 // a11y.ts's IMPACT_TO_SEVERITY table and its axe-violation handling
@@ -45,9 +46,14 @@ function makeFakePage(): Record<string, unknown> {
       return {};
     }),
     waitForLoadState: vi.fn().mockResolvedValue(undefined),
+    // a11y.ts calls page.evaluate() twice per page: once through
+    // revealLazyContent/settleTransitions (return value unused), and once to
+    // count the elements axe actually had to look at — its coverage. A real
+    // rendered page has elements; returning a count here is what makes this
+    // fake a page rather than an empty document.
     evaluate: vi.fn().mockImplementation(async () => {
       callOrder.push("evaluate");
-      return undefined;
+      return bodyElementCount;
     }),
     // a11y.ts reads each flagged node's computed style through page.$eval to
     // decide whether axe misread a -webkit-text-stroke as the foreground.
@@ -59,6 +65,13 @@ function makeFakePage(): Record<string, unknown> {
 }
 
 let nextViolations: unknown[][] = [];
+// The rules axe ran and found nothing wrong with. Non-empty by default: that is
+// what an ordinary page looks like.
+let nextPasses: unknown[] = [{ id: "html-has-lang" }, { id: "region" }];
+// How many elements the page rendered inside <body> — what axe actually had to
+// look at. Zero is an error boundary or a dead SPA shell: a page that scores
+// perfectly precisely because there is nothing on it to fail.
+let bodyElementCount = 42;
 let authRequestedButMissing = false;
 // When set, every page.goto() rejects with this message — a page that never loads.
 let nextGotoError: string | null = null;
@@ -115,7 +128,11 @@ class FakeAxeBuilder {
   async analyze() {
     callOrder.push("analyze");
     const violations = nextViolations.shift() ?? [];
-    return { violations };
+    // A real axe run reports the rules that PASSED and the ones it could not
+    // decide, not just the failures — and that is what proves the rule engine
+    // ran at all. A fixture that returns only `violations` describes a run
+    // that cannot happen, and would let a page axe never examined look clean.
+    return { violations, passes: nextPasses, incomplete: [], inapplicable: [] };
   }
 }
 
@@ -163,6 +180,8 @@ function ctx(urls: string[]): RunnerContext {
 
 beforeEach(() => {
   nextViolations = [];
+  nextPasses = [{ id: "html-has-lang" }, { id: "region" }];
+  bodyElementCount = 42;
   authRequestedButMissing = false;
   callOrder.length = 0;
   nextStrokeStyle = NO_STROKE_STYLE;
@@ -184,7 +203,7 @@ describe("a11yRunner — IMPACT_TO_SEVERITY mapping", () => {
         violation("region", "minor", "#d"),
       ],
     ];
-    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    const result = await derive(a11yRunner, ctx(["https://example.com"]));
     const byId = (id: string) => result.findings.find((f) => f.id === `a11y-${id}`)!;
     expect(byId("color-contrast").severity).toBe("high");
     expect(byId("label-missing").severity).toBe("high");
@@ -194,13 +213,13 @@ describe("a11yRunner — IMPACT_TO_SEVERITY mapping", () => {
 
   it("defaults an undefined impact to the 'minor' mapping (low)", async () => {
     nextViolations = [[violation("mystery-rule", undefined, "#e")]];
-    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    const result = await derive(a11yRunner, ctx(["https://example.com"]));
     expect(result.findings.find((f) => f.id === "a11y-mystery-rule")!.severity).toBe("low");
   });
 
   it("falls back to low for an impact value axe hasn't defined here", async () => {
     nextViolations = [[violation("weird-rule", "unheard-of", "#f")]];
-    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    const result = await derive(a11yRunner, ctx(["https://example.com"]));
     expect(result.findings.find((f) => f.id === "a11y-weird-rule")!.severity).toBe("low");
   });
 });
@@ -211,7 +230,7 @@ describe("a11yRunner — de-dup and tallying across pages", () => {
       [violation("color-contrast", "serious", "#shared", 3)],
       [violation("color-contrast", "serious", "#shared", 3)],
     ];
-    const result = await a11yRunner.run(ctx(["https://example.com/a", "https://example.com/b"]));
+    const result = await derive(a11yRunner, ctx(["https://example.com/a", "https://example.com/b"]));
     const contrastFindings = result.findings.filter((f) => f.id === "a11y-color-contrast");
     expect(contrastFindings).toHaveLength(1);
   });
@@ -227,7 +246,7 @@ describe("a11yRunner — de-dup and tallying across pages", () => {
         violation("color-contrast", "serious", "#footer-link"),
       ],
     ];
-    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    const result = await derive(a11yRunner, ctx(["https://example.com"]));
     const contrastFindings = result.findings.filter((f) => f.id === "a11y-color-contrast");
     expect(contrastFindings).toHaveLength(2);
     expect(contrastFindings.map((f) => f.location).sort()).toEqual([
@@ -243,7 +262,7 @@ describe("a11yRunner — de-dup and tallying across pages", () => {
         violation("link-name", "serious", "#cta"),
       ],
     ];
-    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    const result = await derive(a11yRunner, ctx(["https://example.com"]));
     expect(result.findings.filter((f) => f.id.startsWith("a11y-"))).toHaveLength(2);
   });
 
@@ -252,22 +271,28 @@ describe("a11yRunner — de-dup and tallying across pages", () => {
       [violation("color-contrast", "serious", "#shared", 3)],
       [violation("color-contrast", "serious", "#shared", 3)],
     ];
-    const result = await a11yRunner.run(ctx(["https://example.com/a", "https://example.com/b"]));
+    const result = await derive(a11yRunner, ctx(["https://example.com/a", "https://example.com/b"]));
     expect(result.meta?.contrastNodes).toBe(6);
   });
 
-  it("reports one info finding, mentioning page count, when nothing is found", async () => {
+  it("is clean — no findings, with the pages and rules it actually ran on record — when nothing is found", async () => {
     nextViolations = [[], []];
-    const result = await a11yRunner.run(ctx(["https://example.com/a", "https://example.com/b"]));
-    expect(result.findings).toHaveLength(1);
-    expect(result.findings[0]!.id).toBe("a11y-ok");
-    expect(result.findings[0]!.title).toMatch(/2 page/);
+    const result = await derive(a11yRunner, ctx(["https://example.com/a", "https://example.com/b"]));
+    // No invented "a11y-ok" pass-note. Clean is the absence of findings, and it
+    // only counts as clean because the coverage shows two pages were genuinely
+    // rendered and axe's rules genuinely ran against them.
+    expect(result.findings).toEqual([]);
+    expect(result.status).toBe("ok");
+    expect(result.coverage?.data.pagesAudited).toBe(2);
+    expect(result.coverage?.data.pagesRequested).toBe(2);
+    expect(Number(result.coverage?.data.rulesApplied)).toBeGreaterThan(0);
+    expect(Number(result.coverage?.data.elementsInspected)).toBeGreaterThan(0);
   });
 
   it("notes when auth was configured but the storageState session is missing", async () => {
     authRequestedButMissing = true;
     nextViolations = [[]];
-    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    const result = await derive(a11yRunner, ctx(["https://example.com"]));
     expect(result.note).toMatch(/auth storageState missing/);
   });
 });
@@ -275,7 +300,7 @@ describe("a11yRunner — de-dup and tallying across pages", () => {
 describe("a11yRunner — regression guard for the reveal-on-scroll false negative (bug #2)", () => {
   it("triggers the page's own reveal/settle logic (page.evaluate) before running axe's analyze", async () => {
     nextViolations = [[]];
-    await a11yRunner.run(ctx(["https://example.com"]));
+    await derive(a11yRunner, ctx(["https://example.com"]));
     // revealLazyContent + settleTransitions each call page.evaluate once,
     // and both must happen before AxeBuilder#analyze — a scan that analyzes
     // first (as the historical bug did) audits a page that hasn't revealed
@@ -318,7 +343,7 @@ describe("a11yRunner — -webkit-text-stroke contrast (bug #5)", () => {
   it("downgrades a stroked node whose REAL fill contrast passes to a visible needs-review note, not a hard failure", async () => {
     nextStrokeStyle = strokedButCompliant;
     nextViolations = [[violation("color-contrast", "serious", "h1")]];
-    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    const result = await derive(a11yRunner, ctx(["https://example.com"]));
 
     // No hard contrast failure...
     expect(result.findings.find((f) => f.id === "a11y-color-contrast")).toBeUndefined();
@@ -333,7 +358,7 @@ describe("a11yRunner — -webkit-text-stroke contrast (bug #5)", () => {
   it("KEEPS a hard failure when the stroked node's real fill contrast is genuinely bad — no false negative", async () => {
     nextStrokeStyle = strokedAndGenuinelyBad;
     nextViolations = [[violation("color-contrast", "serious", "p")]];
-    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    const result = await derive(a11yRunner, ctx(["https://example.com"]));
 
     const hard = result.findings.find((f) => f.id === "a11y-color-contrast")!;
     expect(hard).toBeDefined();
@@ -345,7 +370,7 @@ describe("a11yRunner — -webkit-text-stroke contrast (bug #5)", () => {
   it("leaves an unstroked contrast violation completely alone", async () => {
     nextStrokeStyle = NO_STROKE_STYLE;
     nextViolations = [[violation("color-contrast", "serious", "#x")]];
-    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    const result = await derive(a11yRunner, ctx(["https://example.com"]));
     expect(result.findings.find((f) => f.id === "a11y-color-contrast")!.severity).toBe("high");
     expect(result.findings.find((f) => f.id === "a11y-color-contrast-text-stroke")).toBeUndefined();
   });
@@ -353,7 +378,7 @@ describe("a11yRunner — -webkit-text-stroke contrast (bug #5)", () => {
   it("does not touch non-contrast rules even on a stroked element", async () => {
     nextStrokeStyle = strokedButCompliant;
     nextViolations = [[violation("link-name", "serious", "a")]];
-    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    const result = await derive(a11yRunner, ctx(["https://example.com"]));
     expect(result.findings.find((f) => f.id === "a11y-link-name")!.severity).toBe("high");
   });
 });
@@ -366,7 +391,7 @@ describe("a11yRunner — refuses to score when the probe says the target isn't t
       note: "refusing to score — redirected to a known auth gate (labs42.cloudflareaccess.com)",
     };
     nextViolations = [[violation("color-contrast", "serious", "#x")]];
-    const result = await a11yRunner.run(ctx(["https://ds.example.com"]));
+    const result = await derive(a11yRunner, ctx(["https://ds.example.com"]));
     expect(result.status).toBe("error");
     expect(result.note).toMatch(/auth gate/);
     // It must NOT have produced a grade-able finding list off someone else's page.
@@ -385,11 +410,12 @@ describe("a11yRunner — refuses to score when the probe says the target isn't t
 describe("a11yRunner — a page it could not load is never a clean page (42L-1003)", () => {
   it("errors instead of reporting clean when navigation fails", async () => {
     nextGotoError = "net::ERR_CONNECTION_REFUSED";
-    const result = await a11yRunner.run(ctx(["https://example.com"]));
+    const result = await derive(a11yRunner, ctx(["https://example.com"]));
 
     expect(result.status).toBe("error");
-    expect(result.note).toMatch(/never audited|unknown, not clean/i);
-    // The tell of the old bug: the invented pass-note.
+    expect(result.note).toMatch(/no page could be loaded and audited/i);
+    // The tell of the old bug: the invented pass-note. There are no pass-notes
+    // at all now — a runner cannot declare its own success.
     expect(result.findings.map((f) => f.id)).not.toContain("a11y-ok");
   });
 
@@ -400,7 +426,7 @@ describe("a11yRunner — a page it could not load is never a clean page (42L-100
     nextViolations = [[violation("color-contrast", "serious", "#a")], []];
     gotoFailOnCall = 2;
 
-    const result = await a11yRunner.run(
+    const result = await derive(a11yRunner, 
       ctx(["https://example.com", "https://example.com/about"]),
     );
 
@@ -416,7 +442,7 @@ describe("a11yRunner — a page it could not load is never a clean page (42L-100
     nextViolations = [[violation("color-contrast", "serious", "#a")], []];
     newPageFailOnCall = 2;
 
-    const result = await a11yRunner.run(
+    const result = await derive(a11yRunner, 
       ctx(["https://example.com", "https://example.com/about"]),
     );
 
@@ -425,7 +451,7 @@ describe("a11yRunner — a page it could not load is never a clean page (42L-100
   });
 
   it("errors instead of grading A when there are no URLs to audit at all", async () => {
-    const result = await a11yRunner.run(ctx([]));
+    const result = await derive(a11yRunner, ctx([]));
     expect(result.status).toBe("error");
     expect(result.note).toMatch(/no URLs|unknown, not clean/i);
     expect(result.findings.map((f) => f.id)).not.toContain("a11y-ok");
@@ -439,12 +465,47 @@ describe("a11yRunner — a page it could not load is never a clean page (42L-100
     nextViolations = [[], []];
     gotoFailOnCall = 2;
 
-    const result = await a11yRunner.run(
+    const result = await derive(a11yRunner, 
       ctx(["https://example.com", "https://example.com/about"]),
     );
 
     expect(result.status).toBe("error");
     expect(result.note).toMatch(/1 of 2/);
     expect(result.findings.map((f) => f.id)).not.toContain("a11y-ok");
+  });
+});
+
+// ── The blank-page hole (42L-1003) ───────────────────────────────────────────
+//
+// An error boundary, a dead SPA shell, a 200 that renders nothing: axe finds no
+// violations, because there is nothing on the page that any rule applies to. It
+// is the highest score a page can get, and it means the page was never really
+// audited. Grade A for an empty document.
+
+describe("a11yRunner — an empty page is never a clean page (42L-1003)", () => {
+  it("refuses when the page rendered no body content at all", async () => {
+    nextViolations = [[]];
+    nextPasses = [];
+    bodyElementCount = 0; // error boundary / dead SPA shell: nothing rendered
+    const result = await derive(a11yRunner, ctx(["https://example.com"]));
+    expect(result.status).toBe("error");
+    expect(result.note).toMatch(/empty body/i);
+  });
+
+  it("refuses when no accessibility rule applied to any page", async () => {
+    nextViolations = [[]];
+    nextPasses = []; // no rule ran, passed, or came back incomplete
+    const result = await derive(a11yRunner, ctx(["https://example.com"]));
+    expect(result.status).toBe("error");
+    expect(result.note).toMatch(/no accessibility rule applied/i);
+  });
+
+  it("a page that genuinely rendered and genuinely passed its rules is clean", async () => {
+    nextViolations = [[]];
+    const result = await derive(a11yRunner, ctx(["https://example.com"]));
+    expect(result.status).toBe("ok");
+    expect(result.findings).toEqual([]);
+    expect(Number(result.coverage?.data.elementsInspected)).toBeGreaterThan(0);
+    expect(Number(result.coverage?.data.rulesApplied)).toBeGreaterThan(0);
   });
 });
