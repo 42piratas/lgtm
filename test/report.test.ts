@@ -95,6 +95,47 @@ describe("writeReports — JSON contract", () => {
     expect(parsed.passed).toBe(true);
     expect(parsed.totals.info).toBe(1);
   });
+
+  // 42L-1003: an errored runner can still carry real findings — authz reports
+  // the genuinely-open route it DID find alongside the routes it couldn't check.
+  // The section body rendered only the "refused to score" banner and dropped the
+  // findings table, while the severity tiles at the top went on counting them:
+  // the KPI said "1 high", the section said nothing. A finding the reader cannot
+  // see does not exist to them.
+  it("renders the findings an errored runner DID observe, not just the refusal banner", () => {
+    workDir = mkdtempSync(join(tmpdir(), "lgtm-report-test-"));
+    cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(workDir);
+
+    const report = sampleReport({
+      results: [
+        {
+          runnerId: "authz",
+          domain: "authz",
+          status: "error",
+          note: "could not check 2 of 3 routes",
+          findings: [
+            {
+              id: "authz-open-route",
+              title: "/admin is reachable without authentication",
+              severity: "critical",
+              location: "https://example.com/admin",
+            },
+          ],
+          durationMs: 10,
+        },
+      ],
+      totals: { critical: 1, high: 0, medium: 0, low: 0, info: 0 },
+      passed: false,
+    });
+
+    const { html } = writeReports(report);
+    const contents = readFileSync(html, "utf8");
+
+    expect(contents).toContain("Refused to score");
+    // The finding the KPI tile is already counting must be visible in the body.
+    expect(contents).toContain("/admin is reachable without authentication");
+    expect(contents).toContain("https://example.com/admin");
+  });
 });
 
 describe("report.ts — countAtOrAbove (the number the operator actually reads)", () => {

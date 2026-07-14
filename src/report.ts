@@ -234,14 +234,7 @@ function renderRunnerSection(r: RunnerResult, index: number): string {
   const num = String(index + 1).padStart(2, "0");
   const grade = gradeFor(r);
 
-  let body: string;
-  if (r.status === "skipped") {
-    body = `<p class="empty skip">Skipped — no coverage${r.note ? `: ${esc(r.note)}` : ""}.</p>`;
-  } else if (r.status === "error") {
-    body = `<p class="empty err">Refused to score${r.note ? ` — ${esc(r.note)}` : ""}.</p>`;
-  } else if (issues.length === 0) {
-    body = `<p class="empty ok">Clean${r.note ? ` — ${esc(r.note)}` : " — no findings"}.</p>`;
-  } else {
+  const findingsTable = (): string => {
     const rows = issues
       .map(
         (f) => `<tr>
@@ -252,9 +245,29 @@ function renderRunnerSection(r: RunnerResult, index: number): string {
       </tr>`,
       )
       .join("");
-    body = `<table class="findings">
+    return `<table class="findings">
       <thead><tr><th>severity</th><th>finding</th><th>location</th><th>remediation</th></tr></thead>
       <tbody>${rows}</tbody></table>`;
+  };
+
+  let body: string;
+  if (r.status === "skipped") {
+    body = `<p class="empty skip">Skipped — no coverage${r.note ? `: ${esc(r.note)}` : ""}.</p>`;
+  } else if (r.status === "error") {
+    // An errored runner can still carry real findings — authz, for instance,
+    // reports the genuinely-open route it DID find alongside the routes it
+    // couldn't check. Rendering only the banner dropped those from the report
+    // body while the severity tiles at the top of the page went on counting
+    // them: the KPI said "1 high", the section said nothing. A finding the
+    // reader cannot see is a finding that does not exist to them.
+    body = `<p class="empty err">Refused to score${r.note ? ` — ${esc(r.note)}` : ""}.</p>`;
+    if (issues.length > 0) {
+      body += `<p class="empty err">${issues.length} finding${issues.length === 1 ? "" : "s"} were observed before the scan was refused — they are real, but this section is not a complete audit:</p>${findingsTable()}`;
+    }
+  } else if (issues.length === 0) {
+    body = `<p class="empty ok">Clean${r.note ? ` — ${esc(r.note)}` : " — no findings"}.</p>`;
+  } else {
+    body = findingsTable();
   }
 
   return `<div class="secttl" id="r-${esc(r.runnerId)}"><span class="n">${num}</span> ${esc(r.runnerId)}

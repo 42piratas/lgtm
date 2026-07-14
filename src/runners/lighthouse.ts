@@ -107,10 +107,48 @@ export const lighthouseRunner: Runner = {
         };
       }
 
+      // A page that never rendered (NO_FCP, ERRORED_DOCUMENT_REQUEST,
+      // PROTOCOL_TIMEOUT) does NOT come back empty — Lighthouse returns
+      // `categories` present with every `score: null`, plus a `runtimeError`
+      // nobody was reading. The `?? 0` below then turned "unmeasured" into
+      // "measured zero", producing three `medium` findings that sail past the
+      // default `failOn: "high"`: a dead page scored as a passing audit.
+      const runtimeError = (lhr as { runtimeError?: { code?: string; message?: string } })
+        .runtimeError;
+      if (runtimeError?.code && runtimeError.code !== "NO_ERROR") {
+        return {
+          runnerId: this.id,
+          domain: this.domain,
+          status: "error",
+          findings: [],
+          note: `Lighthouse could not measure the page (${runtimeError.code}): ${runtimeError.message ?? "no detail"} — the scores are unknown, not passing.`,
+          durationMs: Date.now() - start,
+        };
+      }
+
+      // We ask for exactly three categories (onlyCategories, above), so all three
+      // must come back scored. A partially-scored report is a partially-measured
+      // page: silently skipping the null one would report "scores meet thresholds"
+      // for a category that was never audited — the same lie, one level down.
+      const unscored = Object.entries(lhr.categories)
+        .filter(([, c]) => (c as { score: number | null }).score === null)
+        .map(([key]) => key);
+      if (unscored.length > 0) {
+        return {
+          runnerId: this.id,
+          domain: this.domain,
+          status: "error",
+          findings: [],
+          note: `Lighthouse did not score ${unscored.join(", ")} — those categories were never measured, so the scores are unknown, not passing.`,
+          durationMs: Date.now() - start,
+        };
+      }
+
       const scores: Record<string, number> = {};
       {
         for (const [key, cat] of Object.entries(lhr.categories)) {
-          const score = cat.score ?? 0;
+          // Never coerce: by here every category is scored, or we refused above.
+          const score = cat.score as number;
           scores[key] = score;
           const threshold = THRESHOLDS[key];
           if (threshold !== undefined && score < threshold) {

@@ -38,7 +38,12 @@ let nextStrokeStyle: Record<string, unknown> = NO_STROKE_STYLE;
 
 function makeFakePage(): Record<string, unknown> {
   return {
-    goto: vi.fn().mockResolvedValue({}),
+    goto: vi.fn().mockImplementation(async () => {
+      gotoCalls += 1;
+      if (nextGotoError) throw new Error(nextGotoError);
+      if (gotoFailOnCall === gotoCalls) throw new Error("net::ERR_NAME_NOT_RESOLVED");
+      return {};
+    }),
     waitForLoadState: vi.fn().mockResolvedValue(undefined),
     evaluate: vi.fn().mockImplementation(async () => {
       callOrder.push("evaluate");
@@ -55,6 +60,11 @@ function makeFakePage(): Record<string, unknown> {
 
 let nextViolations: unknown[][] = [];
 let authRequestedButMissing = false;
+// When set, every page.goto() rejects with this message — a page that never loads.
+let nextGotoError: string | null = null;
+// When set to N, only the Nth goto() call rejects — a partial audit.
+let gotoFailOnCall: number | null = null;
+let gotoCalls = 0;
 
 // A plain class, not vi.fn().mockImplementation(() => ({...})) — `new`
 // semantics for a mocked constructor are unreliable across vi.fn wrapping,
@@ -146,6 +156,9 @@ beforeEach(() => {
   callOrder.length = 0;
   nextStrokeStyle = NO_STROKE_STYLE;
   probeResult = { ok: true };
+  nextGotoError = null;
+  gotoFailOnCall = null;
+  gotoCalls = 0;
 });
 
 describe("a11yRunner — IMPACT_TO_SEVERITY mapping", () => {
@@ -345,5 +358,64 @@ describe("a11yRunner — refuses to score when the probe says the target isn't t
     expect(result.note).toMatch(/auth gate/);
     // It must NOT have produced a grade-able finding list off someone else's page.
     expect(result.findings).toHaveLength(0);
+  });
+});
+
+// ── 42L-1003: a page that never loaded is a page that was never audited ─────
+// The seventh instance of the same lie, found by the architecture review and
+// live on main until now. A failed navigation was recorded as a severity:"info"
+// note, which realFindings() drops; the violation count stayed 0, so the
+// "no violations" pass-note fired, status was "ok", and the run graded A —
+// a clean bill of health for a page that never rendered. Identical to the
+// swallowed-navigation bug fixed in authz (42L-973 #4), in the one runner
+// whose entire job is looking at pages.
+describe("a11yRunner — a page it could not load is never a clean page (42L-1003)", () => {
+  it("errors instead of reporting clean when navigation fails", async () => {
+    nextGotoError = "net::ERR_CONNECTION_REFUSED";
+    const result = await a11yRunner.run(ctx(["https://example.com"]));
+
+    expect(result.status).toBe("error");
+    expect(result.note).toMatch(/never audited|unknown, not clean/i);
+    // The tell of the old bug: the invented pass-note.
+    expect(result.findings.map((f) => f.id)).not.toContain("a11y-ok");
+  });
+
+  it("keeps the violations found on the pages that DID load", async () => {
+    // A run that failed on page 2 still genuinely saw page 1. Throwing page 1's
+    // violations away on the error return would be its own lie — the report must
+    // still show what was actually observed.
+    nextViolations = [[violation("color-contrast", "serious", "#a")], []];
+    gotoFailOnCall = 2;
+
+    const result = await a11yRunner.run(
+      ctx(["https://example.com", "https://example.com/about"]),
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.findings.map((f) => f.id)).toContain("a11y-color-contrast");
+  });
+
+  it("errors instead of grading A when there are no URLs to audit at all", async () => {
+    const result = await a11yRunner.run(ctx([]));
+    expect(result.status).toBe("error");
+    expect(result.note).toMatch(/no URLs|unknown, not clean/i);
+    expect(result.findings.map((f) => f.id)).not.toContain("a11y-ok");
+  });
+
+  it("errors when only SOME of the pages fail to load", async () => {
+    // Page 1 loads and is clean; page 2 refuses. A partial audit is not a pass —
+    // the page that never rendered is unknown, not clean. This is the shape the
+    // old code got wrong most quietly: one good page was enough to keep the
+    // violation count at zero and fire the pass-note.
+    nextViolations = [[], []];
+    gotoFailOnCall = 2;
+
+    const result = await a11yRunner.run(
+      ctx(["https://example.com", "https://example.com/about"]),
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.note).toMatch(/1 of 2/);
+    expect(result.findings.map((f) => f.id)).not.toContain("a11y-ok");
   });
 });

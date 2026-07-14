@@ -225,3 +225,89 @@ describe("lighthouse.ts — failure modes", () => {
     },
   );
 });
+
+// ── 42L-1003: an unmeasured page is not a page that scored zero ─────────────
+// The empty-lhr guard above only catches the case where Lighthouse hands back
+// nothing. It does NOT catch the far commoner one: a page that failed to render
+// comes back with `categories` PRESENT and every `score: null`, plus a
+// `runtimeError` nobody read. `score ?? 0` then turned "unmeasured" into
+// "measured zero" — three findings at `medium`, which sail straight past the
+// default `failOn: "high"`. A dead page scored as a passing performance audit.
+describe("lighthouseRunner — an unmeasured page is never a passing page (42L-1003)", () => {
+  const NULL_SCORES = {
+    lhr: {
+      categories: {
+        performance: { title: "Performance", score: null },
+        "best-practices": { title: "Best Practices", score: null },
+        seo: { title: "SEO", score: null },
+      },
+    },
+  };
+
+  it.each([
+    ["NO_FCP", "The page did not paint any content"],
+    ["ERRORED_DOCUMENT_REQUEST", "Lighthouse could not reliably load the page"],
+    ["PROTOCOL_TIMEOUT", "Waiting for DevTools protocol response has exceeded"],
+  ])("errors when lighthouse reports runtimeError %s", async (code, message) => {
+    lighthouseMock.mockResolvedValue({
+      lhr: { ...NULL_SCORES.lhr, runtimeError: { code, message } },
+    });
+    const r = await lighthouseRunner.run(ctx());
+    expect(r.status).toBe("error");
+    expect(r.findings).toEqual([]);
+    expect(r.note).toMatch(new RegExp(code));
+    expect(r.note).toMatch(/unknown, not passing/i);
+  });
+
+  it("errors when every category came back unscored, even with no runtimeError", async () => {
+    lighthouseMock.mockResolvedValue(NULL_SCORES);
+    const r = await lighthouseRunner.run(ctx());
+    expect(r.status).toBe("error");
+    expect(r.findings).toEqual([]);
+    expect(r.note).toMatch(/unknown, not passing/i);
+  });
+
+  it("never coerces a null score to 0 — the old bug produced medium findings that PASSED", async () => {
+    // The precise regression: null → 0 → below every threshold → three findings,
+    // all `medium` (SEVERITY_BY_SCORE(0) < 0.5), none of which reach the default
+    // failOn: "high". The run passed. It must now refuse instead.
+    lighthouseMock.mockResolvedValue(NULL_SCORES);
+    const r = await lighthouseRunner.run(ctx());
+    expect(r.status).not.toBe("ok");
+    expect(r.findings.filter((f) => f.severity === "medium")).toHaveLength(0);
+    expect(r.findings.map((f) => f.id)).not.toContain("lh-performance");
+  });
+
+  // We pin exactly three categories via onlyCategories, so all three must come
+  // back scored. Skipping the null one and scoring the rest would report
+  // "scores meet thresholds" for a category that was never measured — the same
+  // lie, one level down. A partially-measured page is not a passing page.
+  it("refuses when only SOME categories are unscored", async () => {
+    lighthouseMock.mockResolvedValue({
+      lhr: {
+        categories: {
+          performance: { title: "Performance", score: 0.95 },
+          "best-practices": { title: "Best Practices", score: null },
+          seo: { title: "SEO", score: 0.95 },
+        },
+      },
+    });
+    const r = await lighthouseRunner.run(ctx());
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/best-practices/);
+    expect(r.note).toMatch(/unknown, not passing/i);
+    // The old bug's signature: two good scores carrying a green pass.
+    expect(r.findings.map((f) => f.id)).not.toContain("lh-ok");
+  });
+
+  it("scores normally when all three categories came back measured", async () => {
+    lighthouseMock.mockResolvedValue(
+      lhr({ performance: 0.42, "best-practices": 0.95, seo: 0.95 }),
+    );
+    const r = await lighthouseRunner.run(ctx());
+    expect(r.status).toBe("ok");
+    // performance 0.42 < 0.8 → a real finding, at medium (score < 0.5).
+    expect(r.findings.find((f) => f.id === "lh-performance")?.severity).toBe("medium");
+    expect(r.findings.map((f) => f.id)).not.toContain("lh-seo");
+  });
+});
