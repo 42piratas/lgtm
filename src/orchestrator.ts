@@ -65,6 +65,20 @@ function gate(
       note: "docker unavailable — this containerised scanner never ran",
     };
   }
+  if (req.browser && !caps.browser) {
+    return {
+      ok: false,
+      excused: false,
+      note: "no browser available — this domain was never audited",
+    };
+  }
+  if (req.target && !run.baseUrl) {
+    return {
+      ok: false,
+      excused: false,
+      note: "no target URL — this domain was never audited",
+    };
+  }
   if (req.localhostOnly && !run.isLocalhost) {
     return {
       ok: false,
@@ -75,9 +89,32 @@ function gate(
   return { ok: true };
 }
 
+/**
+ * A runner id nobody recognises is a typo, and a typo must never quietly widen
+ * into a waiver.
+ *
+ * `--only cookie` (for `cookies`) matched no runner, so EVERY runner failed the
+ * `only.includes(r.id)` test, every one was waived, the run had ten waivers and
+ * zero holes — and it printed "PASS: every domain audited". A green build in
+ * which not one scanner executed, reachable by a single mistyped character.
+ * Unknown ids are refused up front instead.
+ */
+function assertKnownRunners(kind: string, ids: string[] | undefined): void {
+  const unknown = (ids ?? []).filter((id) => !ALL_RUNNERS.some((r) => r.id === id));
+  if (unknown.length > 0) {
+    throw new Error(
+      `unknown runner id${unknown.length === 1 ? "" : "s"} in ${kind}: ${unknown.join(", ")}. ` +
+        `Known runners: ${ALL_RUNNERS.map((r) => r.id).join(", ")}`,
+    );
+  }
+}
+
 export async function runAudit(opts: OrchestratorOptions): Promise<AuditReport> {
   const log = opts.log ?? (() => {});
   const startedAt = new Date().toISOString();
+
+  assertKnownRunners("--only", opts.only);
+  assertKnownRunners("the site config's `skip:`", opts.site.skip);
 
   const run: RunContext = {
     baseUrl: opts.baseUrl,

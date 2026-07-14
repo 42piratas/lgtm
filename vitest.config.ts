@@ -7,6 +7,11 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["test/**/*.test.ts"],
+    // The integration suite talks to the real scanner images. It is the only
+    // thing that can catch us asking a tool for its report somewhere the tool
+    // does not write one — but it needs Docker, and it takes minutes. It runs
+    // under its own config (`npm run test:integration`), in its own CI job.
+    exclude: ["test/integration/**", "node_modules/**"],
     // Hard guard: any test that reaches for the network fails immediately and
     // says so, on every machine. See test/setup/no-network.ts — the CI job
     // claims to be hermetic, so the suite has to actually be hermetic.

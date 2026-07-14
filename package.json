@@ -2,7 +2,7 @@
   "name": "lgtm",
   "version": "0.1.0",
   "private": true,
-  "description": "lgtm — cross-site security, accessibility, privacy and quality harness. Runs locally before launch, re-pointable at any live URL.",
+  "description": "lgtm \u2014 cross-site security, accessibility, privacy and quality harness. Runs locally before launch, re-pointable at any live URL.",
   "type": "module",
   "bin": {
     "lgtm": "./src/cli.ts"
@@ -11,7 +11,8 @@
     "audit": "tsx src/cli.ts",
     "setup": "playwright install chromium",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
   },
   "engines": {
     "node": ">=20"

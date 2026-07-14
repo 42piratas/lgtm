@@ -52,11 +52,18 @@ export const lighthouseRunner: Runner = {
    * nothing, and has no verdict to give.
    */
   sufficient(cov: Coverage): string | null {
+    // A category we could not measure is a category we cannot vouch for. Named,
+    // so the operator knows which. The findings from the categories we DID
+    // measure stay in the report — this refuses the verdict, not the evidence.
+    const bad = Number(cov.data.categoriesUnmeasurable ?? 0);
+    if (bad > 0) {
+      return `${bad} categor${bad === 1 ? "y" : "ies"} could not be measured, so the scores are unknown, not passing — ${String(cov.data.unmeasurable ?? "")}`;
+    }
     if (Number(cov.data.categoriesScored ?? 0) === 0) {
-      return "Lighthouse scored no category — the page was never measured";
+      return "Lighthouse scored no category — the page was never measured, so the scores are unknown, not passing";
     }
     if (Number(cov.data.auditsRun ?? 0) === 0) {
-      return "no Lighthouse audit produced a value";
+      return "no Lighthouse audit produced a value — the scores are unknown, not passing";
     }
     return null;
   },
@@ -159,6 +166,14 @@ export const lighthouseRunner: Runner = {
       const scores: Record<string, number> = {};
       const notMeasured: string[] = [];
 
+      // Categories Lighthouse could not measure, and why. Collected rather than
+      // returned on the spot: bailing out of this loop the moment a LATER
+      // category fails threw away the real findings an EARLIER one had already
+      // produced (a genuine performance regression, silently deleted because
+      // an SEO audit errored two iterations later). Every other runner here
+      // preserves what it saw before it lost certainty; this one has to as well.
+      const unmeasurable: string[] = [];
+
       for (const [key, cat] of Object.entries(lhr.categories)) {
         const refs = refsOf(cat);
 
@@ -168,13 +183,13 @@ export const lighthouseRunner: Runner = {
           (r) => (r.weight ?? 1) > 0 && audits[r.id]?.scoreDisplayMode === "error",
         );
         if (errored.length > 0) {
-          return {
-            kind: "failed",
-            note: `Lighthouse audits errored, so ${key} could not be measured — the scores are unknown, not passing: ${errored
+          unmeasurable.push(
+            `${key}: audits errored (${errored
               .map((r) => audits[r.id]?.title ?? r.id)
               .slice(0, 3)
-              .join("; ")}`,
-          };
+              .join("; ")})`,
+          );
+          continue;
         }
 
         // Every contributing audit was not-applicable → Lighthouse hands back 0,
@@ -195,10 +210,8 @@ export const lighthouseRunner: Runner = {
 
         // Null with nothing errored to explain it: unknown, and unknown is not clean.
         if (cat.score === null || cat.score === undefined) {
-          return {
-            kind: "failed",
-            note: `Lighthouse returned no ${key} score — the category was not measured, so the score is unknown, not passing.`,
-          };
+          unmeasurable.push(`${key}: no score returned`);
+          continue;
         }
 
         const score = cat.score;
@@ -236,15 +249,18 @@ export const lighthouseRunner: Runner = {
             `scored ${Object.keys(scores).length} of ${Object.keys(lhr.categories).length} categories (${Object.keys(scores).join(", ") || "none"})`,
             `${auditsRun} audits produced a value`,
             ...notMeasured.map((k) => `NOT scored: ${k} (no applicable audits)`),
+            ...unmeasurable.map((u) => `COULD NOT measure ${u}`),
           ],
           data: {
             categoriesRequested: Object.keys(lhr.categories).length,
             categoriesScored: Object.keys(scores).length,
+            categoriesUnmeasurable: unmeasurable.length,
+            unmeasurable: unmeasurable.join("; "),
             auditsRun,
           },
           provenance: "Lighthouse LHR categories + audits",
         },
-        meta: { scores, notMeasured },
+        meta: { scores, notMeasured, unmeasurable },
       };
     } catch (err) {
       return {

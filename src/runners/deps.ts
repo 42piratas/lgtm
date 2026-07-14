@@ -56,7 +56,10 @@ function cvssFrom(v: { severity?: Array<{ score?: string }> }): number | undefin
  */
 function walkedSources(stderr: string): Array<{ path: string; packages: number }> {
   const out: Array<{ path: string; packages: number }> = [];
-  const re = /Scanned (\S+) file and found (\d+) packages/g;
+  // "…and found 1 package" — osv-scanner pluralises, so an insistence on the
+  // plural would miss every single-dependency manifest, and this runner would
+  // then refuse a repo it had genuinely scanned.
+  const re = /Scanned (\S+) file and found (\d+) packages?/g;
   for (const m of stderr.matchAll(re)) {
     out.push({ path: m[1]!, packages: Number(m[2]) });
   }
@@ -77,11 +80,12 @@ export const depsRunner: Runner = {
    */
   sufficient(cov: Coverage): string | null {
     if (Number(cov.data.sources ?? 0) === 0) {
-      return "no lockfiles or manifests were walked — nothing was audited";
+      return "no lockfiles or manifests were walked — the dependency tree was never audited";
     }
-    if (Number(cov.data.packages ?? 0) === 0) {
-      return "the manifests that were walked resolved to zero packages";
-    }
+    // Deliberately NOT checking the package count. A manifest that genuinely
+    // resolves to zero dependencies (a fresh scaffold) has been audited — there
+    // was simply nothing in it. Refusing that would fail a healthy repo, which
+    // is the same disservice as passing an unscanned one.
     return null;
   },
 
@@ -121,6 +125,23 @@ export const depsRunner: Runner = {
     });
 
     const sources = walkedSources(r.stderr);
+
+    const emptyCoverage: Coverage = {
+      trail: ["walked no lockfile or manifest"],
+      data: { sources: 0, packages: 0 },
+      provenance: "osv-scanner walk log (stderr)",
+    };
+
+    // A repo with nothing to scan is osv-scanner's exit 128, "No package sources
+    // found". That is not a broken tool — the tool worked perfectly and found
+    // nothing to look at, which is a COVERAGE fact, not an error. Reporting it
+    // as "osv-scanner error (exit 128)" sent the operator hunting a container
+    // problem when the real answer is that a lockfile is gitignored and an
+    // entire ecosystem is going unaudited. Hand it to sufficient(), which says
+    // so in as many words.
+    if (/no package sources found/i.test(r.stderr)) {
+      return { kind: "observed", findings, coverage: emptyCoverage };
+    }
 
     // osv-scanner exits 1 when vulns are found, 0 when clean, >1 on real error.
     if (r.code > 1 && !r.stdout.trim().startsWith("{")) {

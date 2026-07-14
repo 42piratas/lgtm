@@ -366,3 +366,32 @@ describe("AuditReport shape — the contract CI consumes", () => {
     expect(report.results).toHaveLength(2);
   });
 });
+
+// ── The typo that waived the entire audit ────────────────────────────────────
+//
+// `--only` waives every runner it does NOT name. Name none of them — because you
+// typed `cookie` for `cookies` — and it waives all ten: ten waivers, zero holes,
+// `complete: true`, `passed: true`, and a report that reads "PASS: every domain
+// audited, every verdict backed by evidence" for a run in which not one scanner
+// executed. The false clean, reachable by one mistyped character.
+
+describe("an unknown runner id is a typo, and a typo must never widen into a waiver", () => {
+  it("refuses a --only id that matches no runner, instead of waiving everything and passing", async () => {
+    const observe = vi.fn(cleanObserve);
+    fakeRunners = [fake("cookies", observe), fake("headers", vi.fn(cleanObserve))];
+    await expect(audit({ only: ["cookie"] })).rejects.toThrow(/unknown runner id/i);
+    expect(observe).not.toHaveBeenCalled();
+  });
+
+  it("refuses an unknown id in the site config's skip list too", async () => {
+    fakeRunners = [fake("cookies", vi.fn(cleanObserve))];
+    await expect(audit({ site: baseSite({ skip: ["zapp"] }) })).rejects.toThrow(
+      /unknown runner id/i,
+    );
+  });
+
+  it("names the runners it does know, so the typo is fixable from the error alone", async () => {
+    fakeRunners = [fake("cookies", vi.fn(cleanObserve)), fake("headers", vi.fn(cleanObserve))];
+    await expect(audit({ only: ["cookie"] })).rejects.toThrow(/cookies, headers/);
+  });
+});

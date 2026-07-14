@@ -419,15 +419,50 @@ describe("sast.ts — semgrep severity mapping", () => {
 
 // ── secrets.ts ────────────────────────────────────────────────────────────────
 
+
+/**
+ * secrets.ts reads gitleaks' report from a FILE in a bind-mounted work dir —
+ * never from stdout. The real image accepts `--report-path /dev/stdout` and then
+ * writes nothing to it, so a runner that read stdout reported zero secrets for
+ * every repo it ever scanned, including one with two AWS keys committed in
+ * plaintext. This fake writes where the real tool writes.
+ *
+ * `body` is the raw report content: a JSON array when there are leaks, and an
+ * EMPTY FILE when the repo is clean — which is what gitleaks actually does.
+ */
+function gitleaksWritesReport(body: string, stderr: string = GITLEAKS_SCANNED) {
+  dockerRunMock.mockImplementation(async (opts: { mountsRW?: Record<string, string> }) => {
+    const dir = opts.mountsRW?.["/out"]!;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "gitleaks.json"), body);
+    return ok("", 0, stderr);
+  });
+}
+
 describe("secrets.ts — gitleaks parsing", () => {
+  it("never asks gitleaks for its report on /dev/stdout — the image accepts that and writes nothing", async () => {
+    gitleaksWritesReport("");
+    await derive(secretsRunner, ctx());
+    const args = dockerRunMock.mock.calls[0]![0].args as string[];
+    const path = args[args.indexOf("--report-path") + 1];
+    expect(
+      path,
+      "asking gitleaks for --report-path /dev/stdout silently returns an empty " +
+        "report for EVERY repo, leaks and all. The runner then reports zero " +
+        "secrets, forever, and every mocked test still passes.",
+    ).not.toBe("/dev/stdout");
+    // It must land in a dir we actually bind-mount read-write and then read back.
+    const mounts = (dockerRunMock.mock.calls[0]![0] as { mountsRW?: Record<string, string> })
+      .mountsRW!;
+    expect(Object.keys(mounts).some((m) => path!.startsWith(m))).toBe(true);
+  });
+
   it("reports every leak as critical — a leaked credential has no lesser severity", async () => {
-    dockerRunMock.mockResolvedValue(
-      ok(
-        JSON.stringify([
-          { RuleID: "aws-key", Description: "AWS key", File: "a.ts", StartLine: 3, Commit: "abcdef1234" },
-          { RuleID: "stripe", Description: "Stripe key", File: "b.ts", StartLine: 9 },
-        ]),
-      ),
+    gitleaksWritesReport(
+      JSON.stringify([
+        { RuleID: "aws-key", Description: "AWS key", File: "a.ts", StartLine: 3, Commit: "abcdef1234" },
+        { RuleID: "stripe", Description: "Stripe key", File: "b.ts", StartLine: 9 },
+      ]),
     );
     const r = await derive(secretsRunner, ctx());
     const leaks = r.findings.filter((f) => f.severity !== "info");
@@ -438,15 +473,15 @@ describe("secrets.ts — gitleaks parsing", () => {
 
   it("de-dupes the same rule+file+line repeated across git history", async () => {
     const leak = { RuleID: "aws-key", Description: "AWS key", File: "a.ts", StartLine: 3 };
-    dockerRunMock.mockResolvedValue(
-      ok(JSON.stringify([{ ...leak, Commit: "aaa" }, { ...leak, Commit: "bbb" }])),
+    gitleaksWritesReport(
+      JSON.stringify([{ ...leak, Commit: "aaa" }, { ...leak, Commit: "bbb" }]),
     );
     const r = await derive(secretsRunner, ctx());
     expect(r.findings.filter((f) => f.severity === "critical")).toHaveLength(1);
   });
 
-  it("reports a clean repo as clean — gitleaks writes NOTHING to the report path when it finds nothing", async () => {
-    dockerRunMock.mockResolvedValue(ok("", 0, GITLEAKS_SCANNED));
+  it("reports a clean repo as clean — gitleaks leaves the report file EMPTY when it finds nothing", async () => {
+    gitleaksWritesReport("");
     const r = await derive(secretsRunner, ctx());
     expect(r.status).toBe("ok");
     expect(r.findings).toEqual([]);
@@ -665,9 +700,7 @@ describe("zapRunner — refuses to scan a target that isn't the site", () => {
 
 describe("a scan that examined nothing is never a clean scan", () => {
   it("secrets: gitleaks pointed at a directory that is not a git repo scans 0 commits, says 'no leaks found', and exits 0 — REFUSE", async () => {
-    dockerRunMock.mockResolvedValue(
-      ok("", 0, "0 commits scanned.\nscanned ~0 bytes (0) in 25.4ms\nno leaks found\n"),
-    );
+    gitleaksWritesReport("", "0 commits scanned.\nscanned ~0 bytes (0) in 25.4ms\nno leaks found\n");
     const r = await derive(secretsRunner, ctx());
     expect(r.status).toBe("error");
     expect(r.note).toMatch(/0 commits/i);
@@ -675,7 +708,7 @@ describe("a scan that examined nothing is never a clean scan", () => {
   });
 
   it("secrets: a repo whose history was read is clean, and says how much it read", async () => {
-    dockerRunMock.mockResolvedValue(ok("", 0, GITLEAKS_SCANNED));
+    gitleaksWritesReport("");
     const r = await derive(secretsRunner, ctx());
     expect(r.status).toBe("ok");
     expect(r.coverage?.data.commits).toBe(14);

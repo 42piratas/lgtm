@@ -474,3 +474,78 @@ describe("lighthouseRunner — an unmeasured page is never a passing page (42L-1
     expect(r.findings.map((f) => f.id)).not.toContain("lh-seo");
   });
 });
+
+// ── Findings deleted by a later category's failure ───────────────────────────
+//
+// The category loop used to `return { kind: "failed" }` the moment ANY category
+// turned out to be unmeasurable — and `derive()` drops findings on a failed
+// outcome. So a genuine performance regression, already collected from a
+// category that scored perfectly well, was silently deleted because an SEO audit
+// errored two iterations later. The report showed lighthouse as "refused to
+// score" with nothing in it, and the reader never learned the site got slower.
+//
+// Losing certainty about one category is not a reason to destroy the evidence
+// from another. Every other runner here already knew that.
+
+describe("lighthouseRunner — a later category's failure never deletes an earlier one's findings", () => {
+  it("keeps the performance finding when a LATER category errored", async () => {
+    lighthouseMock.mockResolvedValue({
+      lhr: {
+        categories: {
+          // Scored, and genuinely bad: 0.42 < the 0.8 threshold.
+          performance: {
+            title: "performance",
+            score: 0.42,
+            auditRefs: [{ id: "perf-audit", weight: 1 }],
+          },
+          // Errored — measured nothing. Iterated AFTER performance.
+          seo: { title: "seo", score: null, auditRefs: [{ id: "seo-audit", weight: 1 }] },
+        },
+        audits: {
+          "perf-audit": { title: "perf audit", scoreDisplayMode: "numeric" },
+          "seo-audit": { title: "seo audit", scoreDisplayMode: "error" },
+        },
+      },
+    });
+    const r = await derive(lighthouseRunner, ctx());
+
+    // Refused, because SEO is unknown…
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/could not be measured/i);
+    expect(r.note).toMatch(/seo/);
+    // …and the performance regression it DID measure survives, in the report,
+    // at its real severity.
+    const perf = r.findings.find((f) => f.id === "lh-performance");
+    expect(
+      perf,
+      "the performance finding was deleted because a later category failed — " +
+        "the report would show 'refused to score' and nothing else, and a real " +
+        "regression would reach nobody.",
+    ).toBeDefined();
+    expect(perf!.severity).toBe("medium");
+    expect(r.coverage?.data.categoriesScored).toBe(1);
+    expect(r.coverage?.data.categoriesUnmeasurable).toBe(1);
+  });
+
+  it("still refuses overall — a category nobody could measure is not a passing category", async () => {
+    lighthouseMock.mockResolvedValue({
+      lhr: {
+        categories: {
+          performance: {
+            title: "performance",
+            score: 1,
+            auditRefs: [{ id: "perf-audit", weight: 1 }],
+          },
+          seo: { title: "seo", score: null, auditRefs: [{ id: "seo-audit", weight: 1 }] },
+        },
+        audits: {
+          "perf-audit": { title: "perf audit", scoreDisplayMode: "numeric" },
+          "seo-audit": { title: "seo audit", scoreDisplayMode: "error" },
+        },
+      },
+    });
+    const r = await derive(lighthouseRunner, ctx());
+    // A perfect performance score does not license silence about SEO.
+    expect(r.status).toBe("error");
+  });
+});
