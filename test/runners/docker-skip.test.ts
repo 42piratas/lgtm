@@ -8,11 +8,16 @@ import type { RunnerContext, SiteConfig } from "../../src/types.js";
 // public run(), with only util/docker.js's hasDocker mocked. No runner file
 // is modified.
 
-vi.mock("../../src/util/docker.js", () => ({
-  hasDocker: vi.fn(),
-  dockerRun: vi.fn(),
-  containerReachableUrl: (u: string) => u,
-}));
+vi.mock("../../src/util/docker.js", async (importOriginal) => {
+  // Partial mock — the real retry predicates stay real (the runners import them).
+  const actual = await importOriginal<typeof import("../../src/util/docker.js")>();
+  return {
+    ...actual,
+    hasDocker: vi.fn(),
+    dockerRun: vi.fn(),
+    containerReachableUrl: (u: string) => u,
+  };
+});
 
 // Belt and braces: zap.ts checks Docker before it probes the target, so this
 // file never reaches the network — but a future reordering must not silently

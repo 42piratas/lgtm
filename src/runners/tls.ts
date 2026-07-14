@@ -2,7 +2,7 @@ import { mkdirSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { promises as dns } from "node:dns";
 import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
-import { hasDocker, dockerRun } from "../util/docker.js";
+import { hasDocker, dockerRun, transientInfraFailureUnless } from "../util/docker.js";
 import { hostOf, isLocalhostUrl } from "../util/http.js";
 
 // TLS/transport assessment via drwetter/testssl.sh in a container.
@@ -73,6 +73,7 @@ export const tlsRunner: Runner = {
     const { ip, total } = await resolveScanTarget(host);
     const work = join(process.cwd(), "reports", ".work", `tls-${ctx.run.stamp}`);
     mkdirSync(work, { recursive: true });
+    const outPath = join(work, "out.json");
     try {
       await dockerRun({
         image: IMAGE,
@@ -97,9 +98,12 @@ export const tlsRunner: Runner = {
         // testssl runs as an unprivileged uid inside; make the dir writable.
         extra: ["--user", "0"],
         timeoutMs: 300_000,
+        // testssl signals findings through its exit code, and its own output is
+        // a FILE. If out.json exists, the scan ran and answered — retrying it
+        // would just burn another couple of minutes to reach the same result.
+        retryOn: transientInfraFailureUnless(() => existsSync(outPath)),
       });
 
-      const outPath = join(work, "out.json");
       if (!existsSync(outPath)) {
         return {
           runnerId: this.id,

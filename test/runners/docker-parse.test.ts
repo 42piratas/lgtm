@@ -23,11 +23,18 @@ import type { RunnerContext, SiteConfig } from "../../src/types.js";
 const dockerRunMock = vi.fn();
 const hasDockerMock = vi.fn();
 
-vi.mock("../../src/util/docker.js", () => ({
-  hasDocker: () => hasDockerMock(),
-  dockerRun: (opts: unknown) => dockerRunMock(opts),
-  containerReachableUrl: (u: string) => u,
-}));
+vi.mock("../../src/util/docker.js", async (importOriginal) => {
+  // Partial mock: hasDocker/dockerRun are faked, but the retry PREDICATES are
+  // the real ones — the runners pass them to dockerRun, and a test that stubbed
+  // them out would happily pass while the real classification was broken.
+  const actual = await importOriginal<typeof import("../../src/util/docker.js")>();
+  return {
+    ...actual,
+    hasDocker: () => hasDockerMock(),
+    dockerRun: (opts: unknown) => dockerRunMock(opts),
+    containerReachableUrl: (u: string) => u,
+  };
+});
 
 // tls.ts resolves the target's addresses so it can pin ONE deterministic
 // endpoint (42L-973 #7 — testssl.sh otherwise loops every resolved IP and

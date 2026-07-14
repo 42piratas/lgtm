@@ -51,6 +51,15 @@ const TRANSIENT_PATTERNS: RegExp[] = [
   /\bunexpected end of/i,
   /\bregistry\b.*\b(unavailable|timeout)\b/i,
   /\b50[0234]\s+(internal|bad gateway|service unavailable|gateway timeout)\b/i,
+  // An OOM-killed / externally-SIGKILLed container. The doc comment above used
+  // to claim this was retried when in fact NOTHING matched exit 137 or a bare
+  // "Killed" — the comment lied, and it failed closed (a memory blip on a busy
+  // CI runner became a hard build failure). A container the kernel shot is the
+  // textbook transient failure: same input, likely fine on a quieter retry.
+  /\bkilled\b/i,
+  /\bout of memory\b/i,
+  /\boom-?killed\b/i,
+  /\bexit(ed)? (with )?(code )?137\b/i,
 ];
 
 /**

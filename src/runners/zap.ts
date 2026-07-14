@@ -1,7 +1,12 @@
 import { mkdirSync, readFileSync, existsSync, rmSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
-import { hasDocker, dockerRun, containerReachableUrl } from "../util/docker.js";
+import {
+  hasDocker,
+  dockerRun,
+  containerReachableUrl,
+  transientInfraFailureUnless,
+} from "../util/docker.js";
 import { probeTarget } from "../util/authgate.js";
 
 // Dynamic scan via OWASP ZAP (container).
@@ -69,6 +74,7 @@ export const zapRunner: Runner = {
     // ZAP runs as its built-in uid 1000; make the bind-mount writable to it.
     chmodSync(workDir, 0o777);
     const reportName = "report.json";
+    const reportPath = join(workDir, reportName);
 
     const r = await dockerRun({
       image: IMAGE,
@@ -76,9 +82,13 @@ export const zapRunner: Runner = {
       mountsRW: { "/zap/wrk": workDir },
       extra: ["--add-host=host.docker.internal:host-gateway"],
       timeoutMs: active ? 1_200_000 : 420_000,
+      // ZAP ALWAYS exits nonzero when it finds alerts — that is a successful
+      // scan, not a failure — and its stdout is full of alert text that can
+      // legitimately mention a 500 it deliberately elicited. Retrying on that
+      // would re-run a full scan (up to 20 minutes) to reach the same answer.
+      // The report file is the ground truth: if it's there, we're done.
+      retryOn: transientInfraFailureUnless(() => existsSync(reportPath)),
     });
-
-    const reportPath = join(workDir, reportName);
     if (!existsSync(reportPath)) {
       rmSync(workDir, { recursive: true, force: true });
       return {
