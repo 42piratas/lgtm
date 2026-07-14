@@ -281,6 +281,20 @@ export const a11yRunner: Runner = {
       };
     }
 
+    // Zero pages audited is zero evidence. The old code walked an empty loop,
+    // counted zero violations, and reported "No WCAG 2.2 AA violations across
+    // 0 page(s)" — grade A for auditing nothing at all.
+    if (ctx.urls.length === 0) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: "no URLs to audit — zero pages were scanned, so the result is unknown, not clean",
+        findings,
+        durationMs: Date.now() - start,
+      };
+    }
+
     const session = new BrowserSession(ctx.site);
     let authNote = "";
     if (session.authRequestedButMissing()) {
@@ -292,11 +306,18 @@ export const a11yRunner: Runner = {
       const context = await session.context();
       // De-dup findings across pages by (rule, target); count occurrences.
       const seen = new Map<string, { finding: Finding; count: number }>();
+      const failedNavigations: string[] = [];
       let contrastNodes = 0;
 
       for (const url of ctx.urls) {
-        const page = await context.newPage();
+        // newPage() must be INSIDE the try: if it throws (browser crash, page
+        // limit, resource exhaustion) on page 3, an outer-catch unwind skips the
+        // seen→findings merge below and silently drops every violation pages 1-2
+        // genuinely found — the exact evidence-loss this fix exists to prevent.
+        let opened: Awaited<ReturnType<typeof context.newPage>> | undefined;
         try {
+          const page = await context.newPage();
+          opened = page;
           await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
           // Let late-mounted client UI settle without hanging on long-poll/analytics.
           await page.waitForLoadState("load", { timeout: 10_000 }).catch(() => {});
@@ -382,17 +403,33 @@ export const a11yRunner: Runner = {
             });
           }
         } catch (err) {
-          findings.push({
-            id: `a11y-nav-${url}`,
-            title: `Could not analyze ${url}: ${(err as Error).message}`,
-            severity: "info",
-          });
+          // A page we could not load is a page we did not audit. Recording that
+          // as a severity:"info" note let realFindings() drop it, left the
+          // violation count at zero, fired the "no violations" pass-note, and
+          // graded the run A — a clean bill of health for a page that never
+          // rendered. Same swallowed-navigation lie as the authz runner's, in
+          // the runner whose whole job is looking at pages.
+          failedNavigations.push(`${url}: ${(err as Error).message}`);
         } finally {
-          await page.close().catch(() => {});
+          await opened?.close().catch(() => {});
         }
       }
 
+      // Findings from the pages that DID load are real and must survive the
+      // error return below — a run that failed on page 3 still saw pages 1-2,
+      // and throwing their violations away would be its own kind of lie.
       for (const { finding } of seen.values()) findings.push(finding);
+
+      if (failedNavigations.length > 0) {
+        return {
+          runnerId: this.id,
+          domain: this.domain,
+          status: "error",
+          note: `could not load ${failedNavigations.length} of ${ctx.urls.length} page(s) — the pages were never audited, so the result is unknown, not clean: ${failedNavigations.join("; ")}`,
+          findings,
+          durationMs: Date.now() - start,
+        };
+      }
 
       const violationCount = [...seen.values()].length;
       if (violationCount === 0) {
