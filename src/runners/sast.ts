@@ -45,16 +45,33 @@ export const sastRunner: Runner = {
       timeoutMs: 480_000,
     });
 
-    let out: SemgrepOutput = {};
-    try {
-      const s = r.stdout.indexOf("{");
-      if (s >= 0) out = JSON.parse(r.stdout.slice(s));
-    } catch {
+    // A clean semgrep --json run always emits at least `{"results":[]}`. If
+    // semgrep dies before writing anything, stdout has no `{` at all — the
+    // old code's `if (s >= 0)` guard meant that case skipped the parse
+    // entirely without throwing, `out` stayed `{}`, and a crashed scan
+    // reported "No Semgrep findings": a gate going green on a repo that was
+    // never scanned. Both "no `{` at all" and "what follows it doesn't
+    // parse" are the same failure and must both error.
+    const s = r.stdout.indexOf("{");
+    if (s < 0) {
       return {
         runnerId: this.id,
         domain: this.domain,
         status: "error",
-        note: `semgrep produced no parseable JSON: ${r.stderr.slice(0, 300)}`,
+        note: `semgrep produced no parseable output (exit ${r.code}): ${(r.stderr || r.stdout).slice(0, 300)}`,
+        findings,
+        durationMs: Date.now() - start,
+      };
+    }
+    let out: SemgrepOutput;
+    try {
+      out = JSON.parse(r.stdout.slice(s));
+    } catch (err) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: `semgrep produced unparseable JSON: ${(err as Error).message}`,
         findings,
         durationMs: Date.now() - start,
       };

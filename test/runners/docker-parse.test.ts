@@ -1,0 +1,623 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { RunnerContext, SiteConfig } from "../../src/types.js";
+
+// The Docker-hosted runners are NOT just "skip when Docker is down". Each one
+// carries a real, pure parse→severity mapping over a scanner's output, and a
+// bug in any of those tables ships a wrong severity into the CI gate:
+//   tls.ts     SEVERITY_MAP  (testssl CRITICAL/HIGH/MEDIUM/LOW/WARN)
+//   deps.ts    SEVERITY_MAP + cvssFrom  (CVSS score → severity bands)
+//   sast.ts    SEVERITY_MAP  (semgrep ERROR/WARNING/INFO)
+//   zap.ts     RISK_MAP      (ZAP riskcode 3/2/1/0)
+//   secrets.ts leak parsing + de-dup (everything is critical)
+//
+// We mock only util/docker.js — hasDocker() true, dockerRun() returning
+// crafted scanner output — and drive each runner's real run(). No file under
+// src/runners/ is modified.
+
+// Plain mock fns referenced through a stable wrapper: vitest's global
+// `restoreMocks: true` wipes a vi.fn()'s implementation between tests, so the
+// implementations are (re)installed in beforeEach rather than in the factory.
+const dockerRunMock = vi.fn();
+const hasDockerMock = vi.fn();
+
+vi.mock("../../src/util/docker.js", async (importOriginal) => {
+  // Partial mock: hasDocker/dockerRun are faked, but the retry PREDICATES are
+  // the real ones — the runners pass them to dockerRun, and a test that stubbed
+  // them out would happily pass while the real classification was broken.
+  const actual = await importOriginal<typeof import("../../src/util/docker.js")>();
+  return {
+    ...actual,
+    hasDocker: () => hasDockerMock(),
+    dockerRun: (opts: unknown) => dockerRunMock(opts),
+    containerReachableUrl: (u: string) => u,
+  };
+});
+
+// tls.ts resolves the target's addresses so it can pin ONE deterministic
+// endpoint (42L-973 #7 — testssl.sh otherwise loops every resolved IP and
+// emits every finding twice). Left unmocked that is real DNS from the unit
+// suite: slow, offline-hostile, and it makes assertions depend on how many
+// A-records a third party happens to publish today. Default: a single address,
+// i.e. the ordinary case. Tests that care about the multi-endpoint path set
+// `resolvedIps` themselves.
+let resolvedIps: string[] = ["93.184.216.34"];
+vi.mock("node:dns", () => ({
+  promises: {
+    resolve4: async () => resolvedIps,
+    resolve6: async () => [],
+  },
+}));
+
+// zap.ts probes the target before spending a container run on it, to refuse
+// auth-gated / non-2xx responses (42L-973 #1/#2). Unmocked, that is a REAL
+// HTTP request from the unit suite — and it is precisely how this file went
+// red on CI while passing locally:
+//
+//   the two active-scan tests use http://localhost:3000. On the author's
+//   laptop an unrelated dev server happened to be listening there and returned
+//   200, so the probe succeeded and zap proceeded. On a CI runner nothing
+//   listens, the connection is refused, the probe burns its retry backoff
+//   (500ms + 1000ms — the tell-tale ~1.5s runtime), zapRunner returns early
+//   with status "error", dockerRun is never called, and the assertions blow up
+//   on an undefined mock call.
+//
+// A unit test must never depend on what is or isn't listening on the machine
+// running it. Probe result is injectable; default is the ordinary "target is
+// reachable and is really the site" case.
+let probeResult: { ok: boolean; note?: string } = { ok: true };
+vi.mock("../../src/util/authgate.js", () => ({
+  probeTarget: async () => probeResult,
+}));
+
+const { tlsRunner } = await import("../../src/runners/tls.js");
+const { depsRunner } = await import("../../src/runners/deps.js");
+const { secretsRunner } = await import("../../src/runners/secrets.js");
+const { sastRunner } = await import("../../src/runners/sast.js");
+const { zapRunner } = await import("../../src/runners/zap.js");
+
+let workRoot: string;
+let cwdSpy: ReturnType<typeof vi.spyOn>;
+
+beforeEach(() => {
+  dockerRunMock.mockReset();
+  hasDockerMock.mockReset();
+  hasDockerMock.mockResolvedValue(true); // Docker is UP for every test here
+  resolvedIps = ["93.184.216.34"]; // single-endpoint host unless a test says otherwise
+  probeResult = { ok: true }; // target reachable and really the site, unless a test says otherwise
+  // tls/zap write their scanner output into a dir under process.cwd(); point
+  // cwd at a temp dir so nothing is written into the repo.
+  workRoot = mkdtempSync(join(tmpdir(), "lgtm-docker-parse-"));
+  cwdSpy = vi.spyOn(process, "cwd").mockReturnValue(workRoot);
+});
+
+afterEach(() => {
+  cwdSpy.mockRestore();
+  rmSync(workRoot, { recursive: true, force: true });
+});
+
+function ok(stdout: string, code = 0) {
+  return { code, stdout, stderr: "", timedOut: false };
+}
+
+function ctx(overrides: Partial<{ baseUrl: string; repoPath: string }> = {}): RunnerContext {
+  const baseUrl = overrides.baseUrl ?? "https://example.com";
+  const site: SiteConfig = {
+    name: "site",
+    baseUrl,
+    repoPath: overrides.repoPath ?? "/repo",
+    routes: [],
+    auth: { type: "none" },
+    failOn: "high",
+  };
+  return {
+    site,
+    run: { baseUrl, isLocalhost: false, allowActive: false, outDir: "", stamp: "stamp" },
+    urls: [baseUrl],
+    caps: { docker: true, browser: true },
+    log: () => {},
+  };
+}
+
+// ── tls.ts ────────────────────────────────────────────────────────────────────
+
+/** tls.ts reads /wrk/out.json from the host dir it bind-mounts read-write. */
+function tlsWritesJson(items: unknown[]) {
+  dockerRunMock.mockImplementation(async (opts: { mountsRW?: Record<string, string> }) => {
+    const dir = opts.mountsRW?.["/wrk"]!;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "out.json"), JSON.stringify(items));
+    return ok("");
+  });
+}
+
+describe("tls.ts — testssl severity mapping", () => {
+  it("maps each testssl severity onto the declared lgtm severity", async () => {
+    tlsWritesJson([
+      { id: "heartbleed", severity: "CRITICAL", finding: "vulnerable" },
+      { id: "RC4", severity: "HIGH", finding: "offered" },
+      { id: "BREACH", severity: "MEDIUM", finding: "potentially vulnerable" },
+      { id: "cert_expiry", severity: "LOW", finding: "30 days" },
+      { id: "TLS1_1", severity: "WARN", finding: "deprecated" },
+    ]);
+    const r = await tlsRunner.run(ctx());
+    const sev = (id: string) => r.findings.find((f) => f.id === `tls-${id}`)?.severity;
+    expect(sev("heartbleed")).toBe("critical");
+    expect(sev("RC4")).toBe("high");
+    expect(sev("BREACH")).toBe("medium");
+    expect(sev("cert_expiry")).toBe("low");
+    expect(sev("TLS1_1")).toBe("low"); // WARN → low
+  });
+
+  it("drops OK/INFO entries entirely rather than scoring them", async () => {
+    tlsWritesJson([
+      { id: "cipherlist", severity: "OK", finding: "all good" },
+      { id: "protocols", severity: "INFO", finding: "TLS1.3 offered" },
+    ]);
+    const r = await tlsRunner.run(ctx());
+    expect(r.findings).toEqual([
+      expect.objectContaining({ id: "tls-ok", severity: "info" }),
+    ]);
+  });
+
+  it("reads the nested scanResult shape as well as a flat array", async () => {
+    dockerRunMock.mockImplementation(async (opts: { mountsRW?: Record<string, string> }) => {
+      const dir = opts.mountsRW?.["/wrk"]!;
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, "out.json"),
+        JSON.stringify({ scanResult: [{ id: "RC4", severity: "HIGH", finding: "offered" }] }),
+      );
+      return ok("");
+    });
+    const r = await tlsRunner.run(ctx());
+    expect(r.findings.find((f) => f.id === "tls-RC4")?.severity).toBe("high");
+  });
+
+  it("errors (not silently passes) when testssl writes no JSON at all", async () => {
+    dockerRunMock.mockResolvedValue(ok(""));
+    const r = await tlsRunner.run(ctx());
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/no JSON/i);
+    expect(r.findings).toEqual([]);
+  });
+
+  it("skips an http/localhost target — there is no TLS to inspect", async () => {
+    const r = await tlsRunner.run(ctx({ baseUrl: "http://localhost:3000" }));
+    expect(r.status).toBe("skipped");
+    expect(dockerRunMock).not.toHaveBeenCalled();
+  });
+});
+
+// ── deps.ts ───────────────────────────────────────────────────────────────────
+
+function osvOutput(vulns: Array<{ id: string; score?: string; name?: string }>) {
+  return JSON.stringify({
+    results: [
+      {
+        source: { path: "/src/package-lock.json" },
+        packages: vulns.map((v) => ({
+          package: { name: v.name ?? "pkg", version: "1.0.0" },
+          vulnerabilities: [
+            {
+              id: v.id,
+              summary: "a vulnerability",
+              ...(v.score ? { severity: [{ type: "CVSS_V3", score: v.score }] } : {}),
+            },
+          ],
+        })),
+      },
+    ],
+  });
+}
+
+describe("deps.ts — CVSS → severity bands", () => {
+  it("maps CVSS scores onto the correct severity band at each boundary", async () => {
+    // Bands: >=9 critical, >=7 high, >=4 medium, else low. The boundaries
+    // themselves are what a `>` vs `>=` slip would break.
+    dockerRunMock.mockResolvedValue(
+      ok(
+        osvOutput([
+          { id: "GHSA-crit", score: "9.0", name: "crit-pkg" },
+          { id: "GHSA-high", score: "7.0", name: "high-pkg" },
+          { id: "GHSA-med", score: "4.0", name: "med-pkg" },
+          { id: "GHSA-low", score: "3.9", name: "low-pkg" },
+        ]),
+        1, // osv-scanner exits 1 when vulns are found — must NOT be treated as an error
+      ),
+    );
+    const r = await depsRunner.run(ctx());
+    expect(r.status).toBe("ok");
+    const sev = (id: string) => r.findings.find((f) => f.id === `dep-${id}`)?.severity;
+    expect(sev("GHSA-crit")).toBe("critical");
+    expect(sev("GHSA-high")).toBe("high");
+    expect(sev("GHSA-med")).toBe("medium");
+    expect(sev("GHSA-low")).toBe("low");
+  });
+
+  it("sits just below each boundary correctly (8.9 high, 6.9 medium, 3.9 low)", async () => {
+    dockerRunMock.mockResolvedValue(
+      ok(
+        osvOutput([
+          { id: "GHSA-a", score: "8.9", name: "a" },
+          { id: "GHSA-b", score: "6.9", name: "b" },
+          { id: "GHSA-c", score: "3.9", name: "c" },
+        ]),
+        1,
+      ),
+    );
+    const r = await depsRunner.run(ctx());
+    const sev = (id: string) => r.findings.find((f) => f.id === `dep-${id}`)?.severity;
+    expect(sev("GHSA-a")).toBe("high");
+    expect(sev("GHSA-b")).toBe("medium");
+    expect(sev("GHSA-c")).toBe("low");
+  });
+
+  it("defaults a vulnerability with no CVSS score to medium — never drops it", async () => {
+    dockerRunMock.mockResolvedValue(ok(osvOutput([{ id: "GHSA-noscore", name: "x" }]), 1));
+    const r = await depsRunner.run(ctx());
+    const f = r.findings.find((x) => x.id === "dep-GHSA-noscore")!;
+    expect(f).toBeDefined();
+    expect(f.severity).toBe("medium");
+  });
+
+  it("extracts the base score out of a full CVSS vector string", async () => {
+    dockerRunMock.mockResolvedValue(
+      ok(osvOutput([{ id: "GHSA-vec", score: "9.8", name: "v" }]), 1),
+    );
+    const r = await depsRunner.run(ctx());
+    expect(r.findings.find((f) => f.id === "dep-GHSA-vec")?.severity).toBe("critical");
+  });
+
+  it("reports a clean scan as a single info finding", async () => {
+    dockerRunMock.mockResolvedValue(ok(JSON.stringify({ results: [] }), 0));
+    const r = await depsRunner.run(ctx());
+    expect(r.findings).toEqual([
+      expect.objectContaining({ id: "deps-ok", severity: "info" }),
+    ]);
+  });
+
+  it("errors on a real scanner failure (exit > 1, no JSON) instead of reporting clean", async () => {
+    dockerRunMock.mockResolvedValue({
+      code: 127,
+      stdout: "",
+      stderr: "image not found",
+      timedOut: false,
+    });
+    const r = await depsRunner.run(ctx());
+    expect(r.status).toBe("error");
+    expect(r.findings).toEqual([]);
+  });
+});
+
+// ── sast.ts ───────────────────────────────────────────────────────────────────
+
+describe("sast.ts — semgrep severity mapping", () => {
+  it("maps ERROR/WARNING/INFO onto high/medium/low", async () => {
+    dockerRunMock.mockResolvedValue(
+      ok(
+        JSON.stringify({
+          results: [
+            { check_id: "rule.err", path: "/src/a.ts", start: { line: 1 }, extra: { severity: "ERROR", message: "bad" } },
+            { check_id: "rule.warn", path: "/src/b.ts", start: { line: 2 }, extra: { severity: "WARNING", message: "meh" } },
+            { check_id: "rule.info", path: "/src/c.ts", start: { line: 3 }, extra: { severity: "INFO", message: "fyi" } },
+          ],
+        }),
+      ),
+    );
+    const r = await sastRunner.run(ctx());
+    const sev = (id: string) => r.findings.find((f) => f.id === `sast-${id}`)?.severity;
+    expect(sev("rule.err")).toBe("high");
+    expect(sev("rule.warn")).toBe("medium");
+    expect(sev("rule.info")).toBe("low");
+  });
+
+  it("falls back to low for an unrecognized semgrep severity", async () => {
+    dockerRunMock.mockResolvedValue(
+      ok(
+        JSON.stringify({
+          results: [
+            { check_id: "rule.weird", path: "/src/a.ts", start: { line: 1 }, extra: { severity: "NONSENSE", message: "?" } },
+          ],
+        }),
+      ),
+    );
+    const r = await sastRunner.run(ctx());
+    expect(r.findings.find((f) => f.id === "sast-rule.weird")?.severity).toBe("low");
+  });
+
+  it("de-dupes identical rule+file+line hits", async () => {
+    const hit = { check_id: "rule.x", path: "/src/a.ts", start: { line: 1 }, extra: { severity: "ERROR", message: "bad" } };
+    dockerRunMock.mockResolvedValue(ok(JSON.stringify({ results: [hit, hit] })));
+    const r = await sastRunner.run(ctx());
+    expect(r.findings.filter((f) => f.id === "sast-rule.x")).toHaveLength(1);
+  });
+
+  it("strips the container's /src/ prefix from the reported location", async () => {
+    dockerRunMock.mockResolvedValue(
+      ok(
+        JSON.stringify({
+          results: [
+            { check_id: "rule.x", path: "/src/deep/a.ts", start: { line: 7 }, extra: { severity: "ERROR", message: "bad" } },
+          ],
+        }),
+      ),
+    );
+    const r = await sastRunner.run(ctx());
+    expect(r.findings.find((f) => f.id === "sast-rule.x")?.location).toBe("deep/a.ts:7");
+  });
+
+  it("errors when semgrep emits malformed JSON", async () => {
+    dockerRunMock.mockResolvedValue({
+      code: 2,
+      stdout: '{"results": [ truncated',
+      stderr: "died",
+      timedOut: false,
+    });
+    const r = await sastRunner.run(ctx());
+    expect(r.status).toBe("error");
+    expect(r.findings).toEqual([]);
+  });
+
+  // FOUND WHILE TESTING — a live bug, and the same class as the "429 reported
+  // as no security headers" defect: when semgrep dies WITHOUT printing any
+  // JSON at all (crash, OOM, bad ruleset → plain-text stderr, empty stdout),
+  // sast.ts's `stdout.indexOf("{")` is -1, so nothing is parsed, nothing
+  // throws, and the runner falls through to its "No Semgrep findings across
+  // security rulesets" info note — a crashed scanner reports CLEAN and the CI
+  // gate goes green on an unscanned repo.
+  //
+  // Fixing it is a src/runners/sast.ts behavior change, which the concurrent
+  // runner-bugs branch owns. Written to the correct post-fix expectation and
+  // left skipped rather than fixed here or faked green.
+  // Was it.skip pending the runner-side fix — 42L-973 #8 shipped it: no `{` in
+  // stdout at all (the shape a crashed/killed container leaves) is now an
+  // error, not a silent "sast-ok". This is the test that would have caught a
+  // gate going green on a repo that was never scanned.
+  it("does not report a clean scan when semgrep crashed with no JSON output at all", async () => {
+    dockerRunMock.mockResolvedValue({
+      code: 2,
+      stdout: "",
+      stderr: "semgrep: fatal error",
+      timedOut: false,
+    });
+    const r = await sastRunner.run(ctx());
+    expect(r.status).toBe("error");
+    expect(r.findings.find((f) => f.id === "sast-ok")).toBeUndefined();
+  });
+});
+
+// ── secrets.ts ────────────────────────────────────────────────────────────────
+
+describe("secrets.ts — gitleaks parsing", () => {
+  it("reports every leak as critical — a leaked credential has no lesser severity", async () => {
+    dockerRunMock.mockResolvedValue(
+      ok(
+        JSON.stringify([
+          { RuleID: "aws-key", Description: "AWS key", File: "a.ts", StartLine: 3, Commit: "abcdef1234" },
+          { RuleID: "stripe", Description: "Stripe key", File: "b.ts", StartLine: 9 },
+        ]),
+      ),
+    );
+    const r = await secretsRunner.run(ctx());
+    const leaks = r.findings.filter((f) => f.severity !== "info");
+    expect(leaks).toHaveLength(2);
+    expect(leaks.every((f) => f.severity === "critical")).toBe(true);
+    expect(r.meta?.leakCount).toBe(2);
+  });
+
+  it("de-dupes the same rule+file+line repeated across git history", async () => {
+    const leak = { RuleID: "aws-key", Description: "AWS key", File: "a.ts", StartLine: 3 };
+    dockerRunMock.mockResolvedValue(
+      ok(JSON.stringify([{ ...leak, Commit: "aaa" }, { ...leak, Commit: "bbb" }])),
+    );
+    const r = await secretsRunner.run(ctx());
+    expect(r.findings.filter((f) => f.severity === "critical")).toHaveLength(1);
+  });
+
+  it("reports a clean repo as a single info finding with a zero leak count", async () => {
+    dockerRunMock.mockResolvedValue(ok("[]"));
+    const r = await secretsRunner.run(ctx());
+    expect(r.findings).toEqual([
+      expect.objectContaining({ id: "secrets-ok", severity: "info" }),
+    ]);
+    expect(r.meta?.leakCount).toBe(0);
+  });
+});
+
+// ── zap.ts ────────────────────────────────────────────────────────────────────
+
+/** zap.ts reads report.json out of the host dir it bind-mounts at /zap/wrk. */
+function zapWritesReport(alerts: unknown[]) {
+  dockerRunMock.mockImplementation(async (opts: { mountsRW?: Record<string, string> }) => {
+    const dir = opts.mountsRW?.["/zap/wrk"]!;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "report.json"), JSON.stringify({ site: [{ alerts }] }));
+    return ok("");
+  });
+}
+
+describe("zap.ts — riskcode mapping", () => {
+  it("maps riskcode 3/2/1 onto high/medium/low and drops riskcode 0 (informational)", async () => {
+    zapWritesReport([
+      { alert: "SQL Injection", riskcode: "3", desc: "d", solution: "s", instances: [{ uri: "u" }] },
+      { alert: "Missing CSP", riskcode: "2", desc: "d", solution: "s", instances: [{ uri: "u" }] },
+      { alert: "Cookie no HttpOnly", riskcode: "1", desc: "d", solution: "s", instances: [{ uri: "u" }] },
+      { alert: "Informational thing", riskcode: "0", desc: "d", solution: "s", instances: [{ uri: "u" }] },
+    ]);
+    const r = await zapRunner.run(ctx());
+    const sevOf = (title: string) =>
+      r.findings.find((f) => f.title.startsWith(title))?.severity;
+    expect(sevOf("SQL Injection")).toBe("high");
+    expect(sevOf("Missing CSP")).toBe("medium");
+    expect(sevOf("Cookie no HttpOnly")).toBe("low");
+    expect(sevOf("Informational thing")).toBeUndefined(); // riskcode 0 → not a finding
+  });
+
+  it("de-dupes repeated alerts of the same name", async () => {
+    zapWritesReport([
+      { alert: "Missing CSP", riskcode: "2", instances: [{ uri: "u1" }] },
+      { alert: "Missing CSP", riskcode: "2", instances: [{ uri: "u2" }] },
+    ]);
+    const r = await zapRunner.run(ctx());
+    expect(r.findings.filter((f) => f.severity !== "info")).toHaveLength(1);
+  });
+
+  it("strips HTML out of ZAP's solution/description prose", async () => {
+    zapWritesReport([
+      {
+        alert: "Missing CSP",
+        riskcode: "2",
+        desc: "<p>A <b>description</b></p>",
+        solution: "<p>Set a <code>header</code></p>",
+        instances: [{ uri: "u" }],
+      },
+    ]);
+    const r = await zapRunner.run(ctx());
+    const f = r.findings.find((x) => x.severity === "medium")!;
+    expect(f.remediation).not.toMatch(/<[^>]+>/);
+    expect(f.evidence).not.toMatch(/<[^>]+>/);
+  });
+
+  it("runs the passive baseline (never the active full-scan) against a remote target", async () => {
+    zapWritesReport([]);
+    const r = await zapRunner.run(ctx({ baseUrl: "https://example.com" }));
+    const args = dockerRunMock.mock.calls[0]![0].args as string[];
+    expect(args[0]).toBe("zap-baseline.py");
+    expect(r.note).toMatch(/passive baseline/);
+  });
+
+  it("runs the active full-scan only when the target is localhost AND --allow-active was passed", async () => {
+    zapWritesReport([]);
+    const c = ctx({ baseUrl: "http://localhost:3000" });
+    c.run.isLocalhost = true;
+    c.run.allowActive = true;
+    const r = await zapRunner.run(c);
+    const args = dockerRunMock.mock.calls[0]![0].args as string[];
+    expect(args[0]).toBe("zap-full-scan.py");
+    expect(r.note).toMatch(/active full-scan/);
+  });
+
+  it("does NOT run the active full-scan on localhost without --allow-active", async () => {
+    zapWritesReport([]);
+    const c = ctx({ baseUrl: "http://localhost:3000" });
+    c.run.isLocalhost = true;
+    c.run.allowActive = false;
+    await zapRunner.run(c);
+    const args = dockerRunMock.mock.calls[0]![0].args as string[];
+    expect(args[0]).toBe("zap-baseline.py");
+  });
+
+  it("errors when ZAP produces no report", async () => {
+    dockerRunMock.mockResolvedValue(ok(""));
+    const r = await zapRunner.run(ctx());
+    expect(r.status).toBe("error");
+  });
+});
+
+// ── 42L-973 #7: multi-endpoint hosts ───────────────────────────────────────
+//
+// testssl.sh loops the whole scan over EVERY resolved address unless told
+// otherwise, concatenating the results — which is exactly why ds.42labs.io and
+// 42piratas.com (both Cloudflare, both multi-IP) reported every TLS finding
+// twice. Adversarial review then pointed out that the first fix (`--ip one`)
+// stops the duplication but picks whichever address DNS happens to return
+// first: non-deterministic across CI machines, and silent about the fact that
+// other endpoints exist. So: pin the lowest sorted address, and say so.
+
+describe("tlsRunner — endpoint pinning on multi-IP hosts (bug #7)", () => {
+  function tlsWrites(entries: unknown[]) {
+    dockerRunMock.mockImplementation(async (opts: { mountsRW?: Record<string, string> }) => {
+      const dir = opts.mountsRW?.["/wrk"]!;
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "out.json"), JSON.stringify(entries));
+      return ok("");
+    });
+  }
+
+  it("pins ONE deterministic endpoint — the lowest address in sorted order, not 'whatever DNS said first'", async () => {
+    resolvedIps = ["104.21.90.166", "172.67.158.51"];
+    tlsWrites([]);
+    await tlsRunner.run(ctx());
+
+    const args = (dockerRunMock.mock.calls[0]![0] as { args: string[] }).args;
+    const ip = args[args.indexOf("--ip") + 1];
+    expect(ip).toBe("104.21.90.166"); // lowest sorted, regardless of DNS order
+    // The hostname is still the scan target, so SNI/cert checks see the real name.
+    expect(args[args.length - 1]).toBe("example.com");
+  });
+
+  it("picks the same endpoint no matter what order DNS returns the addresses in", async () => {
+    resolvedIps = ["172.67.158.51", "104.21.90.166"]; // reversed
+    tlsWrites([]);
+    await tlsRunner.run(ctx());
+    const args = (dockerRunMock.mock.calls[0]![0] as { args: string[] }).args;
+    expect(args[args.indexOf("--ip") + 1]).toBe("104.21.90.166");
+  });
+
+  it("states its own coverage on a multi-endpoint host rather than implying it scanned everything", async () => {
+    resolvedIps = ["104.21.90.166", "172.67.158.51"];
+    tlsWrites([]);
+    const r = await tlsRunner.run(ctx());
+
+    const coverage = r.findings.find((f) => f.id === "tls-endpoint-coverage")!;
+    expect(coverage).toBeDefined();
+    expect(coverage.severity).toBe("info"); // never fails the build
+    expect(coverage.needsReview).toBe(true); // but stays visible
+    expect(coverage.title).toMatch(/1 of 2 resolved endpoints/);
+    expect(r.meta).toMatchObject({ endpointsResolved: 2, endpointScanned: "104.21.90.166" });
+  });
+
+  it("says nothing about coverage on an ordinary single-endpoint host — no noise", async () => {
+    resolvedIps = ["93.184.216.34"];
+    tlsWrites([]);
+    const r = await tlsRunner.run(ctx());
+    expect(r.findings.find((f) => f.id === "tls-endpoint-coverage")).toBeUndefined();
+    expect(r.note).toBeUndefined();
+  });
+
+  it("de-dupes identical (id, finding) pairs even if the scanner still emits them twice", async () => {
+    // Defense in depth: the --ip pin is not the only thing standing between us
+    // and a duplicated report.
+    tlsWrites([
+      { id: "BREACH", severity: "MEDIUM", finding: "potentially VULNERABLE" },
+      { id: "BREACH", severity: "MEDIUM", finding: "potentially VULNERABLE" },
+    ]);
+    const r = await tlsRunner.run(ctx());
+    expect(r.findings.filter((f) => f.id === "tls-BREACH")).toHaveLength(1);
+  });
+});
+
+// The behaviour that was silently untested until CI caught it: zap.ts probes
+// the target BEFORE spending a container run. Nothing exercised the refusal
+// path, so nothing noticed the probe was making a real network call.
+describe("zapRunner — refuses to scan a target that isn't the site", () => {
+  it("errors, and never starts a container, when the probe says the target is auth-gated", async () => {
+    probeResult = {
+      ok: false,
+      note: "refusing to score — redirected to a known auth gate (labs42.cloudflareaccess.com)",
+    };
+    dockerRunMock.mockResolvedValue(ok(""));
+
+    const r = await zapRunner.run(ctx({ baseUrl: "https://ds.example.com" }));
+
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/auth gate/);
+    expect(r.findings).toHaveLength(0);
+    // The point of probing first: don't burn a ZAP run on someone's login page.
+    expect(dockerRunMock).not.toHaveBeenCalled();
+  });
+
+  it("errors, and never starts a container, when the target returns a non-2xx status", async () => {
+    probeResult = { ok: false, note: "refusing to score — HTTP 429 — could not fetch the real page" };
+    dockerRunMock.mockResolvedValue(ok(""));
+
+    const r = await zapRunner.run(ctx());
+
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/429/);
+    expect(dockerRunMock).not.toHaveBeenCalled();
+  });
+});

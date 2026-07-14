@@ -1,7 +1,13 @@
 import { mkdirSync, readFileSync, existsSync, rmSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
-import { hasDocker, dockerRun, containerReachableUrl } from "../util/docker.js";
+import {
+  hasDocker,
+  dockerRun,
+  containerReachableUrl,
+  transientInfraFailureUnless,
+} from "../util/docker.js";
+import { probeTarget } from "../util/authgate.js";
 
 // Dynamic scan via OWASP ZAP (container).
 //   * passive baseline — safe, runs against any reachable target.
@@ -38,8 +44,25 @@ export const zapRunner: Runner = {
     const start = Date.now();
     const findings: Finding[] = [];
 
+    // Cheapest disqualifier first. If Docker isn't there we're skipping
+    // regardless of what the target says, so don't reach out over the network
+    // just to throw the answer away — a skip should cost nothing.
     if (!(await hasDocker())) {
       return skip(this, start, "docker unavailable (ZAP image needs it)");
+    }
+
+    // Then refuse before spending a ZAP container run on content that isn't the
+    // site: an auth-gate redirect or a non-2xx/3xx response.
+    const probe = await probeTarget(ctx.run.baseUrl);
+    if (!probe.ok) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: probe.note,
+        findings,
+        durationMs: Date.now() - start,
+      };
     }
 
     const active = ctx.run.isLocalhost && ctx.run.allowActive;
@@ -51,6 +74,7 @@ export const zapRunner: Runner = {
     // ZAP runs as its built-in uid 1000; make the bind-mount writable to it.
     chmodSync(workDir, 0o777);
     const reportName = "report.json";
+    const reportPath = join(workDir, reportName);
 
     const r = await dockerRun({
       image: IMAGE,
@@ -58,9 +82,13 @@ export const zapRunner: Runner = {
       mountsRW: { "/zap/wrk": workDir },
       extra: ["--add-host=host.docker.internal:host-gateway"],
       timeoutMs: active ? 1_200_000 : 420_000,
+      // ZAP ALWAYS exits nonzero when it finds alerts — that is a successful
+      // scan, not a failure — and its stdout is full of alert text that can
+      // legitimately mention a 500 it deliberately elicited. Retrying on that
+      // would re-run a full scan (up to 20 minutes) to reach the same answer.
+      // The report file is the ground truth: if it's there, we're done.
+      retryOn: transientInfraFailureUnless(() => existsSync(reportPath)),
     });
-
-    const reportPath = join(workDir, reportName);
     if (!existsSync(reportPath)) {
       rmSync(workDir, { recursive: true, force: true });
       return {
@@ -73,11 +101,23 @@ export const zapRunner: Runner = {
       };
     }
 
-    let report: ZapReport = {};
+    // The report file existing doesn't mean it's valid: a killed/truncated
+    // write leaves a file present but not parseable JSON. That must error
+    // like every other "tool didn't actually report anything" case here —
+    // not fall through as a silent "no alerts".
+    let report: ZapReport;
     try {
       report = JSON.parse(readFileSync(reportPath, "utf8"));
-    } catch {
-      /* leave empty */
+    } catch (err) {
+      rmSync(workDir, { recursive: true, force: true });
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: `ZAP report was not parseable JSON: ${(err as Error).message}`,
+        findings,
+        durationMs: Date.now() - start,
+      };
     }
     rmSync(workDir, { recursive: true, force: true });
 

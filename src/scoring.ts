@@ -14,9 +14,13 @@ export function atLeastAsSevere(a: Severity, b: Severity): boolean {
   return severityRank(a) <= severityRank(b);
 }
 
-/** Real problems only — `info` findings are pass-notes, not issues. */
+/**
+ * Real problems only — plain `info` findings are pass-notes, not issues.
+ * A `needsReview` finding is technically severity "info" (never a confirmed
+ * failure) but must stay visible rather than being swept in with pass-notes.
+ */
 export function realFindings(f: Finding[]): Finding[] {
-  return f.filter((x) => x.severity !== "info");
+  return f.filter((x) => x.severity !== "info" || x.needsReview);
 }
 
 export function tallySeverities(results: RunnerResult[]): Record<Severity, number> {
@@ -31,12 +35,23 @@ export function tallySeverities(results: RunnerResult[]): Record<Severity, numbe
   return totals;
 }
 
-/** A run passes when no finding is at or above the site's failOn threshold. */
+/**
+ * A run passes when no runner errored AND no finding is at or above the
+ * site's failOn threshold.
+ *
+ * A runner in status "error" could not actually see the site (auth gate,
+ * bad HTTP status, tool crash, misconfigured scan) — it has no findings to
+ * evaluate, but "no findings" here means "unknown", not "clean". Letting an
+ * errored runner pass silently is exactly how a scanner ends up reporting a
+ * false all-clear: it must not be reportable as anything other than a
+ * failure.
+ */
 export function computePass(
   results: RunnerResult[],
   failOn: Severity,
 ): boolean {
   for (const r of results) {
+    if (r.status === "error") return false;
     for (const f of r.findings) {
       if (f.severity !== "info" && atLeastAsSevere(f.severity, failOn)) {
         return false;
@@ -50,13 +65,11 @@ export function computePass(
 export function gradeFor(result: RunnerResult): string {
   if (result.status === "skipped") return "—";
   if (result.status === "error") return "?";
-  const worst = result.findings
-    .filter((f) => f.severity !== "info")
-    .reduce<Severity | null>(
-      (acc, f) =>
-        acc === null || atLeastAsSevere(f.severity, acc) ? f.severity : acc,
-      null,
-    );
+  const worst = realFindings(result.findings).reduce<Severity | null>(
+    (acc, f) =>
+      acc === null || atLeastAsSevere(f.severity, acc) ? f.severity : acc,
+    null,
+  );
   if (worst === null) return "A";
   const map: Record<Severity, string> = {
     critical: "F",

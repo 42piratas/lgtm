@@ -1,8 +1,8 @@
 import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import pc from "picocolors";
-import type { AuditReport, RunnerResult, Severity } from "./types.js";
-import { gradeFor } from "./scoring.js";
+import type { AuditReport, Finding, RunnerResult, Severity } from "./types.js";
+import { gradeFor, realFindings } from "./scoring.js";
 
 const SEV_COLOR: Record<Severity, (s: string) => string> = {
   critical: pc.magenta,
@@ -21,6 +21,10 @@ const SEV_CHIP: Record<Severity, { bg: string; border: string; text: string }> =
   low: { bg: "#EFF6FF", border: "#BFDBFE", text: "#2563EB" },
   info: { bg: "#F0FDF4", border: "#DCFCE7", text: "#166534" },
 };
+
+// "Needs manual review" is neither a pass-note nor a real severity — it gets
+// its own distinct violet treatment so it can't be mistaken for either.
+const REVIEW_CHIP = { bg: "#F5F3FF", border: "#DDD6FE", text: "#5B21B6" };
 
 // Letter grade → solid chip colour (DS palette).
 const GRADE_HEX: Record<string, string> = {
@@ -58,7 +62,7 @@ export function consoleSummary(report: AuditReport): string {
   lines.push("");
   lines.push(pc.dim("  domain          grade  issues"));
   for (const r of report.results) {
-    const n = r.findings.filter((f) => f.severity !== "info").length;
+    const n = realFindings(r.findings).length;
     const grade = gradeFor(r);
     const gcol =
       grade === "A" ? pc.green : grade === "F" || grade === "D" ? pc.red : grade === "—" || grade === "?" ? pc.dim : pc.yellow;
@@ -66,21 +70,39 @@ export function consoleSummary(report: AuditReport): string {
       r.status === "error"
         ? pc.red(`error${r.note ? ` — ${r.note}` : ""}`)
         : r.status === "skipped"
-          ? pc.dim(`skipped${r.note ? ` — ${r.note}` : ""}`)
+          ? pc.yellow(`skipped${r.note ? ` — ${r.note}` : ""}`)
           : n > 0
             ? sevBreakdown(r)
             : pc.green("clean");
     lines.push(`  ${r.runnerId.padEnd(14)}  ${gcol(grade.padEnd(5))}  ${detail}`);
   }
   lines.push("");
+
+  const errored = report.results.filter((r) => r.status === "error");
+  const skipped = report.results.filter((r) => r.status === "skipped");
+  if (skipped.length > 0) {
+    lines.push(
+      pc.yellow(
+        `  ${skipped.length} runner${skipped.length === 1 ? "" : "s"} skipped — no coverage: ${skipped
+          .map((r) => `${r.runnerId} (${r.note ?? "no reason given"})`)
+          .join("; ")}`,
+      ),
+    );
+  }
+
   const t = report.totals;
   lines.push(
     `  totals: ${SEV_COLOR.critical(`${t.critical} critical`)} · ${SEV_COLOR.high(`${t.high} high`)} · ${SEV_COLOR.medium(`${t.medium} medium`)} · ${SEV_COLOR.low(`${t.low} low`)}`,
   );
   lines.push(
     report.passed
-      ? pc.green(`  PASS `) + pc.dim(`(no findings ≥ ${report.failOn})`)
-      : pc.red(`  FAIL `) + pc.dim(`(findings ≥ ${report.failOn} threshold)`),
+      ? pc.green(`  PASS `) + pc.dim(`(no findings ≥ ${report.failOn}, no runner errors)`)
+      : pc.red(`  FAIL `) +
+          pc.dim(
+            errored.length > 0
+              ? `(${errored.length} runner${errored.length === 1 ? "" : "s"} errored: ${errored.map((r) => r.runnerId).join(", ")}${countAtOrAbove(report) ? ` · findings ≥ ${report.failOn}` : ""})`
+              : `(findings ≥ ${report.failOn} threshold)`,
+          ),
   );
   lines.push("");
   return lines.join("\n");
@@ -93,6 +115,8 @@ function sevBreakdown(r: RunnerResult): string {
   (["critical", "high", "medium", "low"] as Severity[]).forEach((s) => {
     if (c[s]) parts.push(SEV_COLOR[s](`${c[s]}${s[0]}`));
   });
+  const reviewCount = r.findings.filter((f) => f.needsReview).length;
+  if (reviewCount) parts.push(pc.cyan(`${reviewCount}r`));
   return parts.join(" ");
 }
 
@@ -106,7 +130,7 @@ const FAVICON =
   "data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9Im5vIj8+CjwhRE9DVFlQRSBzdmcgUFVCTElDICItLy9XM0MvL0RURCBTVkcgMS4xLy9FTiIgImh0dHA6Ly93d3cudzMub3JnL0dyYXBoaWNzL1NWRy8xLjEvRFREL3N2ZzExLmR0ZCI+Cjxzdmcgd2lkdGg9IjEwMCUiIGhlaWdodD0iMTAwJSIgdmlld0JveD0iMCAwIDQwNyA0MDIiIHZlcnNpb249IjEuMSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4bWxuczp4bGluaz0iaHR0cDovL3d3dy53My5vcmcvMTk5OS94bGluayIgeG1sOnNwYWNlPSJwcmVzZXJ2ZSIgeG1sbnM6c2VyaWY9Imh0dHA6Ly93d3cuc2VyaWYuY29tLyIgc3R5bGU9ImZpbGwtcnVsZTpldmVub2RkO2NsaXAtcnVsZTpldmVub2RkO3N0cm9rZS1saW5lam9pbjpyb3VuZDtzdHJva2UtbWl0ZXJsaW1pdDoyOyI+PHN0eWxlPnBhdGh7ZmlsbDojMDAwfUBtZWRpYSAocHJlZmVycy1jb2xvci1zY2hlbWU6ZGFyayl7cGF0aHtmaWxsOiNmZmZ9fTwvc3R5bGU+CiAgICA8ZyB0cmFuc2Zvcm09Im1hdHJpeCgxLDAsMCwxLC0xNjQ1LjgxLC02OTUuNDQyKSI+CiAgICAgICAgPGcgdHJhbnNmb3JtPSJtYXRyaXgoMSwwLDAsMSwxNjExLjY4LDY2Ni45MDgpIj4KICAgICAgICAgICAgPHBhdGggZD0iTTMwNy43MTksMjguNTM0TDM3Ni41MzYsNjcuNjk4TDI2Ny45OTUsMjEzLjE2NUw0NDAuODc3LDE5MC4yMjZMNDQwLjg3NywyNjcuOTk1TDI2Ny45OTUsMjQ3LjI5NEwyNjcuOTk1LDI0OS41MzJMMzc3LjY1NSwzODguMjg1TDMwNS40ODEsNDI4LjU2OUwyMzYuNjY0LDI2Ny45OTVMMjM0LjQyNiwyNjcuOTk1TDE2MC4wMTQsNDI5LjY4OEw5NS4xMTMsMzg4LjI4NUwyMDMuNjU0LDI0Ni4xNzVMMzQuMTI5LDI2Ny45OTVMMzQuMTI5LDE5MC4yMjZMMjAyLjUzNSwyMTIuMDQ2TDIwMi41MzUsMjA5LjgwOEw5NS4xMTMsNjguODE3TDE2NC40OSwyOS42NTNMMjM1LjU0NSwxODkuMTA3TDIzOC4zNDIsMTg5LjEwN0wzMDcuNzE5LDI4LjUzNFoiLz4KICAgICAgICA8L2c+CiAgICA8L2c+Cjwvc3ZnPgo=";
 
 function realCount(r: RunnerResult): number {
-  return r.findings.filter((f) => f.severity !== "info").length;
+  return realFindings(r.findings).length;
 }
 
 // ── 42labs Design System — light theme HTML report ───────────────────────────
@@ -125,12 +149,31 @@ function renderMasthead(report: AuditReport): string {
 function renderVerdict(report: AuditReport): string {
   const t = report.totals;
   const atOrAbove = countAtOrAbove(report);
+  const errored = report.results.filter((r) => r.status === "error");
   const cls = report.passed ? "pass" : "fail";
-  const text = report.passed
-    ? `PASS — no findings at or above <b>${report.failOn}</b>`
-    : `FAIL — ${atOrAbove} finding${atOrAbove === 1 ? "" : "s"} at or above <b>${report.failOn}</b>`;
+  let text: string;
+  if (report.passed) {
+    text = `PASS — no findings at or above <b>${report.failOn}</b>, no runner errors`;
+  } else if (errored.length > 0) {
+    const ids = errored.map((r) => esc(r.runnerId)).join(", ");
+    text = `FAIL — ${errored.length} runner${errored.length === 1 ? "" : "s"} errored (<b>${ids}</b>) — a scan that couldn't see the site is not a clean bill of health${atOrAbove ? `, plus ${atOrAbove} finding${atOrAbove === 1 ? "" : "s"} at or above <b>${report.failOn}</b>` : ""}`;
+  } else {
+    text = `FAIL — ${atOrAbove} finding${atOrAbove === 1 ? "" : "s"} at or above <b>${report.failOn}</b>`;
+  }
   return `<div class="verdict ${cls}"><span class="badge ${cls}">${report.passed ? "PASS" : "FAIL"}</span> ${text}
     <span class="vsum">${t.critical + t.high} high-severity · ${t.medium} medium · ${t.low} low</span></div>`;
+}
+
+/** Skips must be visible and reasoned — a callout, not a greyed-out row that
+ *  blends into a table full of "clean" results. */
+function renderCoverage(report: AuditReport): string {
+  const skipped = report.results.filter((r) => r.status === "skipped");
+  if (skipped.length === 0) return "";
+  const items = skipped
+    .map((r) => `<li><b>${esc(r.runnerId)}</b> — ${esc(r.note ?? "no reason given")}</li>`)
+    .join("");
+  return `<div class="coverage"><b>${skipped.length} runner${skipped.length === 1 ? "" : "s"} not run — no coverage here:</b>
+    <ul>${items}</ul></div>`;
 }
 
 function renderKpis(report: AuditReport): string {
@@ -157,9 +200,9 @@ function renderOverview(report: AuditReport): string {
       const n = realCount(r);
       const status =
         r.status === "error"
-          ? `<span class="tag err">error</span>`
+          ? `<span class="tag err">error — refused to score</span>`
           : r.status === "skipped"
-            ? `<span class="tag muted">skipped</span>`
+            ? `<span class="tag skip">skipped — no coverage</span>`
             : n > 0
               ? `<span class="tag warn">${n} finding${n === 1 ? "" : "s"}</span>`
               : `<span class="tag ok">clean</span>`;
@@ -179,23 +222,30 @@ function renderOverview(report: AuditReport): string {
   </table></div>`;
 }
 
+function chipFor(f: Finding): string {
+  if (f.needsReview) {
+    return `<span class="chip review" style="background:${REVIEW_CHIP.bg};border-color:${REVIEW_CHIP.border};color:${REVIEW_CHIP.text}">needs review</span>`;
+  }
+  return `<span class="chip" style="background:${SEV_CHIP[f.severity].bg};border-color:${SEV_CHIP[f.severity].border};color:${SEV_CHIP[f.severity].text}">${f.severity}</span>`;
+}
+
 function renderRunnerSection(r: RunnerResult, index: number): string {
-  const issues = r.findings.filter((f) => f.severity !== "info");
+  const issues = realFindings(r.findings);
   const num = String(index + 1).padStart(2, "0");
   const grade = gradeFor(r);
 
   let body: string;
   if (r.status === "skipped") {
-    body = `<p class="empty">Skipped${r.note ? ` — ${esc(r.note)}` : ""}.</p>`;
+    body = `<p class="empty skip">Skipped — no coverage${r.note ? `: ${esc(r.note)}` : ""}.</p>`;
   } else if (r.status === "error") {
-    body = `<p class="empty err">Errored${r.note ? ` — ${esc(r.note)}` : ""}.</p>`;
+    body = `<p class="empty err">Refused to score${r.note ? ` — ${esc(r.note)}` : ""}.</p>`;
   } else if (issues.length === 0) {
     body = `<p class="empty ok">Clean${r.note ? ` — ${esc(r.note)}` : " — no findings"}.</p>`;
   } else {
     const rows = issues
       .map(
         (f) => `<tr>
-        <td><span class="chip" style="background:${SEV_CHIP[f.severity].bg};border-color:${SEV_CHIP[f.severity].border};color:${SEV_CHIP[f.severity].text}">${f.severity}</span></td>
+        <td>${chipFor(f)}</td>
         <td class="find">${esc(f.title)}${f.standard ? `<div class="std">${esc(f.standard)}</div>` : ""}</td>
         <td class="loc">${f.location ? esc(f.location) : ""}</td>
         <td class="rem">${f.remediation ? esc(f.remediation) : ""}</td>
@@ -264,6 +314,12 @@ function renderHtml(report: AuditReport): string {
   .verdict b{font-weight:600}
   .vsum{font-family:var(--font-mono);font-size:11.5px;color:var(--fg-muted);margin-left:auto}
 
+  .coverage{font-size:13px;color:#9A3412;background:#FFF7ED;border:1px solid #FED7AA;
+    border-left:3px solid #EA580C;border-radius:8px;padding:12px 15px;margin:0 0 16px}
+  .coverage b{font-weight:600}
+  .coverage ul{margin:6px 0 0;padding-left:18px}
+  .coverage li{margin:2px 0;font-family:var(--font-mono);font-size:12px}
+
   .kpis{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0 4px}
   .kpi{flex:1;min-width:120px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:11px 13px}
   .kpi .l{font-family:var(--font-mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--fg-muted)}
@@ -278,7 +334,7 @@ function renderHtml(report: AuditReport): string {
   .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:6px 4px;
     box-shadow:0 1px 2px rgba(28,25,23,.04)}
   .empty{font-size:13px;color:var(--fg-muted);padding:14px 14px;margin:0;font-family:var(--font-mono)}
-  .empty.ok{color:#166534}.empty.err{color:#991B1B}
+  .empty.ok{color:#166534}.empty.err{color:#991B1B}.empty.skip{color:#9A3412}
 
   table{width:100%;border-collapse:collapse;font-size:12.5px}
   thead th{font-family:var(--font-mono);color:var(--accent-2);font-weight:600;font-size:9.5px;letter-spacing:.05em;
@@ -295,7 +351,8 @@ function renderHtml(report: AuditReport): string {
   .grade.sm{width:19px;height:19px;font-size:11px}
   .tag{font-family:var(--font-mono);font-size:11px;padding:2px 9px;border-radius:999px}
   .tag.ok{background:#F0FDF4;color:#166534}.tag.warn{background:#FEFCE8;color:#854D0E}
-  .tag.err{background:#FEF2F2;color:#991B1B}.tag.muted{background:#F5F5F4;color:#756D68}
+  .tag.err{background:#FEF2F2;color:#991B1B}
+  .tag.skip{background:#FFF7ED;color:#9A3412;border:1px solid #FED7AA;font-weight:600}
 
   .findings .chip{font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:.04em;
     padding:2px 8px;border-radius:999px;border:1px solid;white-space:nowrap;font-weight:600}
@@ -314,6 +371,7 @@ function renderHtml(report: AuditReport): string {
 </style></head><body><div class="wrap">
   ${renderMasthead(report)}
   ${renderVerdict(report)}
+  ${renderCoverage(report)}
   ${renderKpis(report)}
   ${renderOverview(report)}
   ${sections}

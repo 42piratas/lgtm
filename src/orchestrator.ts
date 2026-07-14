@@ -13,7 +13,7 @@ import { ALL_RUNNERS } from "./runners/index.js";
 import { resolveUrls } from "./config.js";
 import { hasDocker } from "./util/docker.js";
 import { isLocalhostUrl } from "./util/http.js";
-import { tallySeverities, computePass } from "./scoring.js";
+import { tallySeverities, computePass, realFindings } from "./scoring.js";
 
 export interface OrchestratorOptions {
   site: SiteConfig;
@@ -96,12 +96,12 @@ export async function runAudit(opts: OrchestratorOptions): Promise<AuditReport> 
     log(`${pc.cyan("run ")}  ${runner.id} — ${runner.title}`);
     try {
       const res = await runner.run(ctx);
-      const n = res.findings.filter((f) => f.severity !== "info").length;
+      const n = realFindings(res.findings).length;
       const tag =
         res.status === "error"
           ? pc.red("err ")
           : res.status === "skipped"
-            ? pc.dim("skip")
+            ? pc.yellow("skip")
             : n > 0
               ? pc.yellow(`${n} issue${n === 1 ? "" : "s"}`)
               : pc.green("clean");

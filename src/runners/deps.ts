@@ -51,9 +51,33 @@ export const depsRunner: Runner = {
       return skip(this, start, "docker unavailable (osv-scanner image needs it)");
     }
 
+    // osv-scanner respects the repo's .gitignore by default. That's correct
+    // for build output, but real lockfiles are routinely gitignored too —
+    // e.g. a Jekyll repo's Gemfile.lock (42piratas.com) — and get silently
+    // excluded from the walk entirely: "No package sources found", the
+    // *entire* ecosystem goes unaudited, and it looks like a tool error
+    // rather than a coverage hole. --no-ignore restores them. The same
+    // gitignore rule ordinarily hides node_modules, .git, and (in this
+    // fleet's convention) .worktrees/ — --no-ignore would otherwise pull
+    // those back in too (vendor noise, or duplicate scans of stale worktree
+    // checkouts), so exclude them explicitly instead.
     const r = await dockerRun({
       image: IMAGE,
-      args: ["scan", "source", "--recursive", "--format", "json", "/src"],
+      args: [
+        "scan",
+        "source",
+        "--recursive",
+        "--no-ignore",
+        "--experimental-exclude",
+        "r:node_modules",
+        "--experimental-exclude",
+        "r:\\.git",
+        "--experimental-exclude",
+        "r:\\.worktrees",
+        "--format",
+        "json",
+        "/src",
+      ],
       mounts: { "/src": repo },
       timeoutMs: 300_000,
     });
@@ -70,12 +94,34 @@ export const depsRunner: Runner = {
       };
     }
 
-    let out: OsvOutput = {};
+    // A clean osv-scanner JSON run always emits at least `{"results":[]}` —
+    // if stdout has no `{` at all, or what follows it doesn't parse, the
+    // tool didn't produce real output (crash, OOM, truncated write). That is
+    // "unknown", not "zero vulnerabilities": silently falling through to an
+    // empty `out` here is exactly how a dead scanner reports a clean pass.
+    const s = r.stdout.indexOf("{");
+    if (s < 0) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: `osv-scanner produced no parseable output (exit ${r.code}): ${(r.stderr || r.stdout).slice(0, 300)}`,
+        findings,
+        durationMs: Date.now() - start,
+      };
+    }
+    let out: OsvOutput;
     try {
-      const s = r.stdout.indexOf("{");
-      if (s >= 0) out = JSON.parse(r.stdout.slice(s));
-    } catch {
-      /* empty / non-json → treated as clean below */
+      out = JSON.parse(r.stdout.slice(s));
+    } catch (err) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: `osv-scanner produced unparseable JSON: ${(err as Error).message}`,
+        findings,
+        durationMs: Date.now() - start,
+      };
     }
 
     for (const result of out.results ?? []) {

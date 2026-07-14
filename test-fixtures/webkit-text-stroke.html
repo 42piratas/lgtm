@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>webkit-text-stroke contrast repro (42L-973 #5)</title>
+<style>
+  body { background: #ffffff; font-family: sans-serif; padding: 40px; }
+  /*
+   * Real, compliant contrast: fill #4A4A4A on #FFFFFF background is 8.86:1
+   * (WCAG AA requires 4.5:1 for normal text — this comfortably passes).
+   *
+   * The -webkit-text-stroke below is a pure decorative outline. Its color
+   * (#E5E5E5, close to the white background) is what a buggy contrast
+   * checker reads as "the foreground" instead of the actual text `color`
+   * fill — producing a ~1.3:1 ratio and a false failure.
+   */
+  .stroke-text {
+    color: #4A4A4A;
+    -webkit-text-stroke: 3px #E5E5E5;
+    font-size: 28px;
+    font-weight: 600;
+  }
+</style>
+</head>
+<body>
+  <h1 class="stroke-text">This text is 8.86:1 compliant — do not flag it as failing</h1>
+</body>
+</html>

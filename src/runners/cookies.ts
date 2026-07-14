@@ -1,5 +1,11 @@
 import type { Finding, Runner, RunnerContext, RunnerResult } from "../types.js";
-import { fetchUrl, isLocalhostUrl } from "../util/http.js";
+import { isLocalhostUrl } from "../util/http.js";
+import {
+  detectAuthGate,
+  badStatusReason,
+  fetchTarget,
+  unreachableNote,
+} from "../util/authgate.js";
 
 // Cookie hygiene + basic CSRF signal, parsed from raw Set-Cookie lines.
 // Aligned with OWASP ASVS 3.4 (cookie-based session management).
@@ -37,15 +43,42 @@ export const cookiesRunner: Runner = {
     const url = ctx.run.baseUrl;
     const https = url.startsWith("https://") && !isLocalhostUrl(url);
 
-    let res;
-    try {
-      res = await fetchUrl(url, { timeoutMs: 30_000 });
-    } catch (err) {
+    // Transport failures get a bounded retry before we conclude anything (see
+    // util/retry.ts); a bad *status* does not — that's a definite answer.
+    const attempt = await fetchTarget(url);
+    if (!attempt.res) {
       return {
         runnerId: this.id,
         domain: this.domain,
         status: "error",
-        note: `fetch failed: ${(err as Error).message}`,
+        note: unreachableNote(url, attempt.err),
+        findings,
+        durationMs: Date.now() - start,
+      };
+    }
+    const res = attempt.res;
+
+    // Same rule as headers: an auth-gate redirect or a non-2xx/3xx response
+    // means we never actually saw the site's cookies — "no cookies found"
+    // would silently misreport as "clean".
+    const gate = detectAuthGate(url, res.finalUrl);
+    if (gate.gated) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: `refusing to score — ${gate.reason}`,
+        findings,
+        durationMs: Date.now() - start,
+      };
+    }
+    const bad = badStatusReason(res.status);
+    if (bad) {
+      return {
+        runnerId: this.id,
+        domain: this.domain,
+        status: "error",
+        note: `refusing to score — ${bad}`,
         findings,
         durationMs: Date.now() - start,
       };
