@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, existsSync, rmSync, chmodSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type {
   Coverage,
   Finding,
@@ -13,6 +14,15 @@ import { dockerRun } from "../util/docker.js";
 // and working tree. White-box: needs the repo checkout.
 
 const IMAGE = "ghcr.io/gitleaks/gitleaks:latest";
+
+// Baseline config shipped beside this file. `useDefault = true` keeps the full
+// upstream ruleset and only adds an allowlist for hash-shaped literals (content
+// hashes, SRI integrity) that the generic-api-key rule otherwise reports as
+// critical secrets. Resolved from the module URL, not cwd, so it works whatever
+// directory the CLI is invoked from.
+const BASELINE_CONFIG = fileURLToPath(
+  new URL("./gitleaks-baseline.toml", import.meta.url),
+);
 
 interface Leak {
   Description?: string;
@@ -90,6 +100,8 @@ export const secretsRunner: Runner = {
           "detect",
           "--source",
           "/repo",
+          "--config",
+          "/config/gitleaks.toml",
           "--report-format",
           "json",
           "--report-path",
@@ -99,7 +111,7 @@ export const secretsRunner: Runner = {
           "--exit-code",
           "0", // findings are not a failure — we read the report ourselves
         ],
-        mounts: { "/repo": repo },
+        mounts: { "/repo": repo, "/config/gitleaks.toml": BASELINE_CONFIG },
         mountsRW: { "/out": work },
         timeoutMs: 300_000,
       });

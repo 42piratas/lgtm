@@ -1,0 +1,40 @@
+# LGTM baseline gitleaks config.
+#
+# Loaded via `--config` on every secrets scan. `useDefault = true` keeps the
+# entire upstream gitleaks ruleset intact — this file ONLY adds an allowlist for
+# values that pattern-match a secret but provably are not credentials.
+#
+# The generic-api-key rule flags any high-entropy token, which includes content
+# hashes and subresource-integrity strings — SHA-256 digests, SRI hashes, and
+# the like litter lockfiles, drift checks, and asset manifests. Left unallowed
+# they turn every such literal into a critical "leaked secret" and make the gate
+# cry wolf until someone switches it off.
+#
+# Scope is deliberately narrow: only hash-SHAPED values. Real credentials with a
+# distinctive shape (AKIA…, sk_live_…, ghp_…, -----BEGIN…) are matched by their
+# own rules and are untouched — the allowlist can only ever mask the generic
+# high-entropy rule. 40-hex (SHA-1 / legacy PATs) is intentionally NOT
+# allowlisted — too many real secrets share that shape.
+#
+# ACCEPTED RISK: a real secret that is *exactly* 64 lowercase-hex chars and
+# nothing else — e.g. `openssl rand -hex 32`, a raw HMAC/webhook signing key —
+# will NOT be flagged. The backstop is not committing such secrets in the first
+# place (use a vault/env, prefix them) plus a per-repo `.gitleaksignore` for the
+# inverse case. We take this over a gate that cries wolf on every content hash.
+#
+# NOTE: `--config` supersedes a repo's own `.gitleaks.toml` (no repo in the fleet
+# ships one today); a repo's `.gitleaksignore` is still honoured independently.
+
+title = "LGTM baseline"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Content hashes and SRI integrity strings are not credentials"
+regexes = [
+  # A SHA-256 digest: exactly 64 lowercase hex chars, the whole captured value.
+  '''^[a-f0-9]{64}$''',
+  # Subresource-integrity: sha256-/sha384-/sha512- followed by base64.
+  '''^sha(256|384|512)-[A-Za-z0-9+/]{20,}={0,2}$''',
+]
