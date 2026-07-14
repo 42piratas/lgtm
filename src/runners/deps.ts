@@ -6,11 +6,113 @@ import type {
   RunnerOutcome,
 } from "../types.js";
 import { dockerRun } from "../util/docker.js";
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
 
 // Dependency CVEs via Google's osv-scanner (container). White-box: needs the
 // repo checkout. Reports lockfile-resolved vulnerabilities across ecosystems.
 
 const IMAGE = "ghcr.io/google/osv-scanner:latest";
+
+// Filenames that DECLARE dependencies (manifests) or pin them (lockfiles),
+// across every ecosystem osv-scanner resolves. This set only has to answer one
+// yes/no question: does this repo have a dependency tree at all? Its presence
+// proves there is something to audit; its total absence proves there is not —
+// which is what separates a coverage hole from a genuinely dep-free repo.
+//
+// SAFETY: this must be a SUPERSET of what osv-scanner recognises. A filename osv
+// scans but that is missing here would let a repo with real (but unwalked)
+// dependencies read as dep-free and PASS — the exact false-clean this runner
+// exists to prevent. When osv adds an ecosystem, add its manifest/lockfile here.
+// Erring toward inclusion is safe (at worst a false "has deps" → an error to
+// investigate); omission is not (a false "dep-free" → a silent pass).
+const DEP_FILES = new Set([
+  // JavaScript / TypeScript
+  "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb",
+  // Ruby
+  "Gemfile", "Gemfile.lock", "gems.rb", "gems.locked",
+  // Python
+  "requirements.txt", "pyproject.toml", "Pipfile", "Pipfile.lock", "poetry.lock",
+  "pdm.lock", "uv.lock", "pylock.toml",
+  // Go
+  "go.mod", "go.sum",
+  // Rust
+  "Cargo.toml", "Cargo.lock",
+  // Java / Kotlin / JVM
+  "pom.xml", "build.gradle", "build.gradle.kts", "gradle.lockfile", "buildscript-gradle.lockfile",
+  "verification-metadata.xml",
+  // PHP
+  "composer.json", "composer.lock",
+  // .NET  (plus *.csproj / *.fsproj / *.vbproj matched by suffix below)
+  "packages.config", "packages.lock.json", "deps.json",
+  // Dart / Flutter
+  "pubspec.yaml", "pubspec.lock",
+  // Elixir
+  "mix.exs", "mix.lock",
+  // C / C++ (Conan)
+  "conanfile.txt", "conanfile.py", "conan.lock",
+  // R
+  "renv.lock",
+  // Swift / CocoaPods
+  "Package.swift", "Package.resolved", "Podfile", "Podfile.lock",
+  // Haskell
+  "cabal.project", "cabal.project.freeze", "stack.yaml", "stack.yaml.lock", "package.yaml",
+]);
+// Project-file extensions whose base name varies per project (.NET, Haskell).
+const DEP_SUFFIXES = [".csproj", ".fsproj", ".vbproj", ".cabal"];
+
+// Directories that never hold a repo's OWN declared dependencies, so a manifest
+// found inside one is not evidence THIS repo has a dependency tree: vendored
+// third-party trees (node_modules/vendor carry foreign manifests), VCS
+// internals, generated build output, and this fleet's linked worktree
+// checkouts. Note this is intentionally BROADER than the osv-scanner
+// --experimental-exclude set below (which only drops node_modules/.git/
+// .worktrees): those directories are for the vuln scan, this list is for
+// "whose dependency is it". Skipping them can only ever hide a foreign or
+// generated manifest, never the repo's own root/src manifest.
+const SKIP_DIRS = new Set([
+  "node_modules", ".git", ".worktrees", "vendor", "dist", "build", ".next",
+]);
+
+// A dep-free repo is walked in full (nothing short-circuits it), so bound the
+// walk. On overflow we return TRUE — the safe default: "assume this repo has
+// dependencies", which yields an error to investigate rather than a false
+// dep-free pass. A tree this large realistically has a manifest anyway.
+const MAX_DIRS_WALKED = 50_000;
+
+/**
+ * Does the repo contain ANY dependency-declaring file? This is the signal that
+ * separates the two ways osv-scanner can walk zero sources — a genuinely
+ * dependency-free repo (nothing to audit → clean) versus a repo that declares
+ * dependencies but had none of them walked (a lockfile went missing → an
+ * ecosystem is unaudited). Short-circuits on the first hit. Directory symlinks
+ * are not followed (readdir dirents report them as neither file nor dir), which
+ * also makes the walk loop-proof. An unreadable or missing root reads as "no
+ * manifest" — the safe answer for a truly empty checkout, matching the
+ * never-ran refusal that `sufficient()` applies separately.
+ */
+function hasDependencyManifest(root: string): boolean {
+  const stack: string[] = [root];
+  let walked = 0;
+  while (stack.length) {
+    if (++walked > MAX_DIRS_WALKED) return true;
+    const dir = stack.pop()!;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (!SKIP_DIRS.has(e.name)) stack.push(join(dir, e.name));
+      } else if (DEP_FILES.has(e.name) || DEP_SUFFIXES.some((s) => e.name.endsWith(s))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 const SEVERITY_MAP = (cvss?: number): Finding["severity"] => {
   if (cvss === undefined) return "medium";
@@ -73,14 +175,34 @@ export const depsRunner: Runner = {
   requires: { repo: true, docker: true },
 
   /**
-   * Zero lockfiles walked means the whole dependency tree went unexamined —
-   * the single most common way this runner lies, because a gitignored
-   * lockfile silently removes an entire ecosystem from the scan and the tool
-   * still exits reporting nothing.
+   * Zero sources walked has two opposite meanings, and only one is a failure.
+   * If the repo DECLARES dependencies somewhere but none were walked, a lockfile
+   * went missing and an entire ecosystem is unaudited — the coverage hole this
+   * runner exists to catch (a gitignored lockfile is the classic cause, though
+   * --no-ignore now rescues that case; what remains is a manifest with no
+   * lockfile committed at all). If the repo declares NOTHING — a docs, static,
+   * or meta repo with no dependency tree — there is nothing to audit and this is
+   * a clean pass, not "insufficient evidence". `manifestPresent`, computed from
+   * the checkout in observe(), is what tells the two apart.
    */
   sufficient(cov: Coverage): string | null {
     if (Number(cov.data.sources ?? 0) === 0) {
-      return "no lockfiles or manifests were walked — the dependency tree was never audited";
+      // The absence of the manifest probe means observe() never established
+      // anything about this repo — coverage from a scan that never ran. That is
+      // a refusal, per the evidence contract: "no findings" must never be
+      // indistinguishable from "never looked".
+      if (!("manifestPresent" in cov.data)) {
+        return "no dependency-scan evidence — the scanner left no walk log at all";
+      }
+      // observe() DID walk the checkout. If it found dependency manifests but
+      // the scan resolved none of them, an ecosystem went unaudited — refuse.
+      if (cov.data.manifestPresent === true) {
+        return "dependency manifests are present but none were walked — a lockfile is missing, so an ecosystem went unaudited";
+      }
+      // It walked the checkout and confirmed there is no dependency-declaring
+      // file at all: a docs/static/meta repo with nothing to audit. A clean
+      // pass — not "insufficient evidence".
+      return null;
     }
     // Deliberately NOT checking the package count. A manifest that genuinely
     // resolves to zero dependencies (a fresh scaffold) has been audited — there
@@ -92,6 +214,12 @@ export const depsRunner: Runner = {
   async observe(ctx: RunnerContext): Promise<RunnerOutcome> {
     const findings: Finding[] = [];
     const repo = ctx.site.repoPath!;
+
+    // Read off the checkout, before the scan, whether this repo declares any
+    // dependencies at all. sufficient() needs it to tell a dep-free repo (pass)
+    // from one whose dependency tree went unwalked (error) — the walk log alone
+    // reports "zero sources" for both.
+    const manifestPresent = hasDependencyManifest(repo);
 
     // osv-scanner respects the repo's .gitignore by default. That's correct
     // for build output, but real lockfiles are routinely gitignored too —
@@ -128,7 +256,7 @@ export const depsRunner: Runner = {
 
     const emptyCoverage: Coverage = {
       trail: ["walked no lockfile or manifest"],
-      data: { sources: 0, packages: 0 },
+      data: { sources: 0, packages: 0, manifestPresent },
       provenance: "osv-scanner walk log (stderr)",
     };
 
@@ -199,7 +327,7 @@ export const depsRunner: Runner = {
         trail: sources.map(
           (s2) => `walked ${s2.path.replace(/^\/src\/?/, "")} — ${s2.packages} packages`,
         ),
-        data: { sources: sources.length, packages },
+        data: { sources: sources.length, packages, manifestPresent },
         provenance: "osv-scanner walk log (stderr)",
       },
       meta: { sources: sources.map((s2) => s2.path), packages },

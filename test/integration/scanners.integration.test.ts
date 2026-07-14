@@ -179,10 +179,29 @@ describe("deps — coverage is read from what osv-scanner says it walked", () =>
     expect(r.coverage?.data.packages).toBe(1);
   });
 
-  it("REFUSES a repo with no manifest at all — nothing was walked, so nothing is known", async () => {
+  it("PASSES a repo with no manifest at all — no dependency tree means nothing to audit, not a coverage hole", async () => {
+    // The real osv-scanner walks this README-only repo and finds no package
+    // sources. That is not a failure: there is genuinely nothing to audit, so
+    // the runner passes it clean. (The opposite case — a manifest present but
+    // walked to zero sources — is a coverage hole and still errors; that path
+    // is exercised in the unit suite where the manifest presence is controlled.)
     const r = await derive(depsRunner, ctx(cleanRepo));
+    expect(r.status).toBe("ok");
+    expect(r.findings).toEqual([]);
+    expect(r.coverage?.data.manifestPresent).toBe(false);
+  });
+
+  it("REFUSES a repo that DECLARES dependencies but resolves none — a manifest with no lockfile is a coverage hole, not a pass", async () => {
+    // package.json committed, no lockfile: the real osv-scanner walks zero
+    // sources, but the repo plainly has a dependency tree. Passing it would be
+    // the false clean this runner exists to prevent, so it must error.
+    const manifestNoLockRepo = repoWith(
+      { "package.json": JSON.stringify({ name: "declared", version: "1.0.0", dependencies: { "left-pad": "1.3.0" } }) },
+      "manifest-no-lock",
+    );
+    const r = await derive(depsRunner, ctx(manifestNoLockRepo));
     expect(r.status).toBe("error");
-    expect(r.note).toMatch(/no lockfiles or manifests were walked/i);
+    expect(r.note).toMatch(/manifests are present but none were walked/i);
   });
 });
 

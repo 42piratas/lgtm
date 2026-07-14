@@ -300,11 +300,50 @@ describe("deps.ts — CVSS → severity bands", () => {
     expect(r.coverage?.data.packages).toBe(304);
   });
 
-  it("REFUSES a scan that walked no manifest at all — a gitignored lockfile silently removes a whole ecosystem, and the tool still exits reporting nothing", async () => {
+  it("REFUSES a scan that DECLARES dependencies but walked none — a missing lockfile silently removes a whole ecosystem, and the tool still exits reporting nothing", async () => {
+    const repoPath = join(workRoot, "has-manifest");
+    mkdirSync(repoPath, { recursive: true });
+    writeFileSync(join(repoPath, "package.json"), '{"name":"x","dependencies":{"lodash":"^4"}}');
     dockerRunMock.mockResolvedValue(ok(JSON.stringify({ results: [] }), 0, "No package sources found\n"));
-    const r = await derive(depsRunner, ctx());
+    const r = await derive(depsRunner, ctx({ repoPath }));
     expect(r.status).toBe("error");
-    expect(r.note).toMatch(/no lockfiles or manifests were walked/i);
+    expect(r.note).toMatch(/manifests are present but none were walked/i);
+  });
+
+  it("PASSES a genuinely dependency-free repo — no manifest anywhere is nothing to audit, not a coverage hole (docs/static/meta repos)", async () => {
+    const repoPath = join(workRoot, "dep-free");
+    mkdirSync(join(repoPath, "docs"), { recursive: true });
+    writeFileSync(join(repoPath, "README.md"), "# just docs\n");
+    writeFileSync(join(repoPath, "docs", "guide.md"), "content\n");
+    dockerRunMock.mockResolvedValue(ok(JSON.stringify({ results: [] }), 0, "No package sources found\n"));
+    const r = await derive(depsRunner, ctx({ repoPath }));
+    expect(r.status).toBe("ok");
+    expect(r.findings).toEqual([]);
+    expect(r.coverage?.data.manifestPresent).toBe(false);
+  });
+
+  it.each(["Cargo.toml", "go.mod", "requirements.txt", "conanfile.txt", "renv.lock", "Podfile"])(
+    "detects a non-npm manifest (%s) so a repo with real deps that walked nothing is REFUSED, not passed",
+    async (manifest) => {
+      const repoPath = join(workRoot, `manifest-${manifest.replace(/\W/g, "")}`);
+      mkdirSync(repoPath, { recursive: true });
+      writeFileSync(join(repoPath, manifest), "dep\n");
+      dockerRunMock.mockResolvedValue(ok(JSON.stringify({ results: [] }), 0, "No package sources found\n"));
+      const r = await derive(depsRunner, ctx({ repoPath }));
+      expect(r.status).toBe("error");
+      expect(r.note).toMatch(/manifests are present but none were walked/i);
+    },
+  );
+
+  it("does NOT count a vendored manifest as the repo's own — a node_modules/*/package.json leaves a dep-free repo dep-free", async () => {
+    const repoPath = join(workRoot, "vendored-only");
+    mkdirSync(join(repoPath, "node_modules", "left-pad"), { recursive: true });
+    writeFileSync(join(repoPath, "node_modules", "left-pad", "package.json"), '{"name":"left-pad"}');
+    writeFileSync(join(repoPath, "index.md"), "docs\n");
+    dockerRunMock.mockResolvedValue(ok(JSON.stringify({ results: [] }), 0, "No package sources found\n"));
+    const r = await derive(depsRunner, ctx({ repoPath }));
+    expect(r.status).toBe("ok");
+    expect(r.coverage?.data.manifestPresent).toBe(false);
   });
 
   it("errors on a real scanner failure (exit > 1, no JSON) instead of reporting clean", async () => {
