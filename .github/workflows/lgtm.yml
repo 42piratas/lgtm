@@ -1,0 +1,14 @@
+# LGTM eats its own dog food: the gate runs over LGTM's own source on every PR.
+# Uses the reusable workflow from this same checkout (./) so a change to the
+# gate is exercised by the very PR that makes it.
+name: LGTM
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    uses: ./.github/workflows/gate.yml
