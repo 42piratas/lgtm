@@ -1,0 +1,107 @@
+# Reusable LGTM gate — the fleet-wide quality gate.
+#
+# Any repo can call this to block a PR on the white-box checks (dependencies,
+# secrets, static analysis) that LGTM runs over its own source. It is
+# deliberately code-only: these three need nothing but the checkout, so they
+# gate every PR fast. The live-surface checks (headers, TLS, a11y, perf, DAST)
+# need a running deployment and belong in a post-deploy run, not here.
+#
+# Caller (in the target repo, .github/workflows/lgtm.yml):
+#
+#   name: LGTM
+#   on: pull_request
+#   permissions:
+#     contents: read
+#   jobs:
+#     gate:
+#       uses: 4242labs/lgtm/.github/workflows/gate.yml@main
+#
+# LGTM is public, so the default GITHUB_TOKEN checks it out from any repo,
+# public or private.
+
+name: LGTM gate
+
+on:
+  workflow_call:
+    inputs:
+      lgtm-ref:
+        description: Git ref of 4242labs/lgtm to run the gate from.
+        type: string
+        default: main
+      only:
+        description: Comma-separated runner ids the gate enforces.
+        type: string
+        default: deps,secrets,sast
+      fail-on:
+        description: Fail the build at or above this severity (critical|high|medium|low).
+        type: string
+        default: high
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: lgtm ${{ inputs.only }}
+    runs-on: ubuntu-latest # ships with Docker; the white-box scanners need it
+    steps:
+      # The repo under audit. fetch-depth 0 so the secrets scanner walks the
+      # full history, not just the tip commit.
+      - name: Checkout target repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: target
+          fetch-depth: 0
+
+      - name: Checkout LGTM
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: 4242labs/lgtm
+          ref: ${{ inputs.lgtm-ref }}
+          path: lgtm
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: lgtm/package-lock.json
+
+      - name: Install LGTM
+        working-directory: lgtm
+        run: npm ci
+
+      # A throwaway site config pointing the white-box scanners at the checkout.
+      # baseUrl is a required-but-unused placeholder here: --only runs no
+      # black-box runner, so nothing is probed over the network.
+      # Values reach the shell through env, never spliced into the script — a
+      # ${{ }} expression in a run: block is a script-injection vector, and
+      # LGTM's own static-analysis gate flags it.
+      - name: Write gate config
+        env:
+          REPO: ${{ github.repository }}
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          cat > lgtm/sites/_gate.yaml <<EOF
+          name: _gate
+          label: "$REPO"
+          baseUrl: http://localhost
+          repoPath: "$WORKSPACE/target"
+          EOF
+
+      - name: Run gate
+        working-directory: lgtm
+        env:
+          ONLY: ${{ inputs.only }}
+          FAIL_ON: ${{ inputs.fail-on }}
+        run: npx tsx src/cli.ts run _gate --only "$ONLY" --fail-on "$FAIL_ON"
+
+      # The evidence report — always uploaded, so a red gate is inspectable.
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lgtm-report
+          path: |
+            lgtm/reports/**/*.html
+            lgtm/reports/**/*.json
+          if-no-files-found: warn

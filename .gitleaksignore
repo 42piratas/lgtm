@@ -1,0 +1,10 @@
+# Reviewed, accepted secret-scan findings. Each line is a gitleaks fingerprint
+# (commit:file:rule:line) we have looked at and deliberately allow.
+#
+# These two are the fake AWS key pair that test/integration/scanners.integration.test.ts
+# plants to prove the secrets runner actually catches a leak. They are not real
+# credentials. The source literal was later split into fragments so no new commit
+# carries a contiguous match, but this immutable historical commit still does —
+# hence the pinned fingerprints below.
+a7a80ebfb2f5e028ac14c619bd1013908d1be6b4:test/integration/scanners.integration.test.ts:generic-api-key:77
+a7a80ebfb2f5e028ac14c619bd1013908d1be6b4:test/integration/scanners.integration.test.ts:generic-api-key:78
