@@ -278,26 +278,97 @@ describe("lighthouseRunner — an unmeasured page is never a passing page (42L-1
     expect(r.findings.map((f) => f.id)).not.toContain("lh-performance");
   });
 
-  // We pin exactly three categories via onlyCategories, so all three must come
-  // back scored. Skipping the null one and scoring the rest would report
-  // "scores meet thresholds" for a category that was never measured — the same
-  // lie, one level down. A partially-measured page is not a passing page.
-  it("refuses when only SOME categories are unscored", async () => {
-    lighthouseMock.mockResolvedValue({
+  // A category's score goes null the moment ANY audit inside it is unscored
+  // (Lighthouse's arithmeticMean returns null if a single item is null). So a
+  // null category does NOT by itself mean the page wasn't measured — it can
+  // equally mean one audit legitimately didn't apply.
+  //
+  // Lighthouse CI, Google's own build gate, draws the line by CAUSE: an audit
+  // with scoreDisplayMode "notApplicable" counts as a pass; an audit that ran
+  // and produced nothing is a hard failure ("Audit did not produce a value at
+  // all"). We match that. Refusing on every null category instead would
+  // red-build healthy sites — which is how a gate gets switched off.
+  function withAudits(
+    cats: Record<string, { score: number | null; auditRefs: string[] }>,
+    audits: Record<string, { scoreDisplayMode: string; title: string }>,
+  ) {
+    return {
       lhr: {
-        categories: {
-          performance: { title: "Performance", score: 0.95 },
-          "best-practices": { title: "Best Practices", score: null },
-          seo: { title: "SEO", score: 0.95 },
-        },
+        audits,
+        categories: Object.fromEntries(
+          Object.entries(cats).map(([k, c]) => [
+            k,
+            { title: k, score: c.score, auditRefs: c.auditRefs.map((id) => ({ id })) },
+          ]),
+        ),
       },
-    });
+    };
+  }
+
+  it("refuses when a category is unscored because an audit ERRORED", async () => {
+    lighthouseMock.mockResolvedValue(
+      withAudits(
+        {
+          performance: { score: 0.95, auditRefs: ["fcp"] },
+          "best-practices": { score: null, auditRefs: ["is-on-https"] },
+          seo: { score: 0.95, auditRefs: ["viewport"] },
+        },
+        {
+          fcp: { scoreDisplayMode: "numeric", title: "First Contentful Paint" },
+          "is-on-https": { scoreDisplayMode: "error", title: "Uses HTTPS" },
+          viewport: { scoreDisplayMode: "binary", title: "Has a viewport meta tag" },
+        },
+      ),
+    );
     const r = await lighthouseRunner.run(ctx());
     expect(r.status).toBe("error");
     expect(r.note).toMatch(/best-practices/);
     expect(r.note).toMatch(/unknown, not passing/i);
-    // The old bug's signature: two good scores carrying a green pass.
     expect(r.findings.map((f) => f.id)).not.toContain("lh-ok");
+  });
+
+  it("does NOT refuse when a category is unscored only because audits were NOT APPLICABLE", async () => {
+    // The healthy-page false-FAIL this rule exists to avoid.
+    lighthouseMock.mockResolvedValue(
+      withAudits(
+        {
+          performance: { score: 0.95, auditRefs: ["fcp"] },
+          "best-practices": { score: null, auditRefs: ["image-alt"] },
+          seo: { score: 0.95, auditRefs: ["viewport"] },
+        },
+        {
+          fcp: { scoreDisplayMode: "numeric", title: "First Contentful Paint" },
+          "image-alt": { scoreDisplayMode: "notApplicable", title: "Images have alt text" },
+          viewport: { scoreDisplayMode: "binary", title: "Has a viewport meta tag" },
+        },
+      ),
+    );
+    const r = await lighthouseRunner.run(ctx());
+    expect(r.status).toBe("ok");
+    // …but it must never be reported as a pass for that category. It is surfaced,
+    // visibly, as "no verdict" — never scored, never hidden.
+    const na = r.findings.find((f) => f.id === "lh-best-practices-not-measured");
+    expect(na?.needsReview).toBe(true);
+    expect(r.findings.map((f) => f.id)).not.toContain("lh-ok");
+    expect((r.meta as { scores: Record<string, number> }).scores).not.toHaveProperty(
+      "best-practices",
+    );
+  });
+
+  it("refuses when NO category scored at all, even with nothing errored", async () => {
+    lighthouseMock.mockResolvedValue(
+      withAudits(
+        {
+          performance: { score: null, auditRefs: ["image-alt"] },
+          "best-practices": { score: null, auditRefs: ["image-alt"] },
+          seo: { score: null, auditRefs: ["image-alt"] },
+        },
+        { "image-alt": { scoreDisplayMode: "notApplicable", title: "Images have alt text" } },
+      ),
+    );
+    const r = await lighthouseRunner.run(ctx());
+    expect(r.status).toBe("error");
+    expect(r.note).toMatch(/never measured/i);
   });
 
   it("scores normally when all three categories came back measured", async () => {

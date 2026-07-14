@@ -310,8 +310,14 @@ export const a11yRunner: Runner = {
       let contrastNodes = 0;
 
       for (const url of ctx.urls) {
-        const page = await context.newPage();
+        // newPage() must be INSIDE the try: if it throws (browser crash, page
+        // limit, resource exhaustion) on page 3, an outer-catch unwind skips the
+        // seen→findings merge below and silently drops every violation pages 1-2
+        // genuinely found — the exact evidence-loss this fix exists to prevent.
+        let opened: Awaited<ReturnType<typeof context.newPage>> | undefined;
         try {
+          const page = await context.newPage();
+          opened = page;
           await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
           // Let late-mounted client UI settle without hanging on long-poll/analytics.
           await page.waitForLoadState("load", { timeout: 10_000 }).catch(() => {});
@@ -405,7 +411,7 @@ export const a11yRunner: Runner = {
           // the runner whose whole job is looking at pages.
           failedNavigations.push(`${url}: ${(err as Error).message}`);
         } finally {
-          await page.close().catch(() => {});
+          await opened?.close().catch(() => {});
         }
       }
 

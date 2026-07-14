@@ -65,13 +65,24 @@ let nextGotoError: string | null = null;
 // When set to N, only the Nth goto() call rejects — a partial audit.
 let gotoFailOnCall: number | null = null;
 let gotoCalls = 0;
+// When set to N, the Nth newPage() call throws — the browser itself dying mid-run.
+let newPageFailOnCall: number | null = null;
+let newPageCalls = 0;
 
 // A plain class, not vi.fn().mockImplementation(() => ({...})) — `new`
 // semantics for a mocked constructor are unreliable across vi.fn wrapping,
 // a real class guarantees the instance shape a11y.ts expects.
 class FakeBrowserSession {
   async context() {
-    return { newPage: async () => makeFakePage() };
+    return {
+      newPage: async () => {
+        newPageCalls += 1;
+        if (newPageFailOnCall === newPageCalls) {
+          throw new Error("Target page, context or browser has been closed");
+        }
+        return makeFakePage();
+      },
+    };
   }
   authRequestedButMissing() {
     return authRequestedButMissing;
@@ -159,6 +170,8 @@ beforeEach(() => {
   nextGotoError = null;
   gotoFailOnCall = null;
   gotoCalls = 0;
+  newPageFailOnCall = null;
+  newPageCalls = 0;
 });
 
 describe("a11yRunner — IMPACT_TO_SEVERITY mapping", () => {
@@ -386,6 +399,22 @@ describe("a11yRunner — a page it could not load is never a clean page (42L-100
     // still show what was actually observed.
     nextViolations = [[violation("color-contrast", "serious", "#a")], []];
     gotoFailOnCall = 2;
+
+    const result = await a11yRunner.run(
+      ctx(["https://example.com", "https://example.com/about"]),
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.findings.map((f) => f.id)).toContain("a11y-color-contrast");
+  });
+
+  it("keeps the violations already found when the BROWSER itself dies mid-run", async () => {
+    // newPage() throwing (browser crash, page limit, OOM) unwinds past the loop
+    // to the outer catch. If the seen→findings merge sits after the loop, every
+    // violation found on the earlier pages is silently dropped — status is still
+    // "error", so the gate holds, but the evidence is gone from the report.
+    nextViolations = [[violation("color-contrast", "serious", "#a")], []];
+    newPageFailOnCall = 2;
 
     const result = await a11yRunner.run(
       ctx(["https://example.com", "https://example.com/about"]),
