@@ -204,4 +204,24 @@ describe("lighthouse.ts — failure modes", () => {
     expect(r.status).toBe("error");
     expect(r.note).toMatch(/lh exploded/);
   });
+
+  // Lighthouse's contract is `Promise<RunnerResult | undefined>`: it can resolve
+  // with NOTHING, without throwing. That path used to skip the whole scoring loop
+  // and land in the empty-findings branch, which reports "scores meet thresholds".
+  // A scan that measured nothing was reported as a scan that passed.
+  it.each([
+    ["resolves undefined", undefined],
+    ["resolves without an lhr", {}],
+    ["resolves with an lhr but no categories", { lhr: {} }],
+  ])(
+    "errors (never reports a clean pass) when lighthouse %s",
+    async (_label, resolved) => {
+      lighthouseMock.mockResolvedValue(resolved);
+      const r = await lighthouseRunner.run(ctx());
+      expect(r.status).toBe("error");
+      expect(r.findings).toEqual([]);
+      expect(r.findings.map((f) => f.id)).not.toContain("lh-ok");
+      expect(r.note).toMatch(/unknown, not passing/i);
+    },
+  );
 });

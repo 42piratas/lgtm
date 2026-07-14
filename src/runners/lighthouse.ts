@@ -89,8 +89,26 @@ export const lighthouseRunner: Runner = {
         } as never,
       );
       const lhr = runnerResult?.lhr;
+
+      // Lighthouse's own contract is `Promise<RunnerResult | undefined>` — it can
+      // resolve with nothing at all, without throwing. If we let that fall through,
+      // zero categories get scored, zero findings are produced, and the empty-findings
+      // branch below cheerfully reports "scores meet thresholds" for a scan that
+      // measured nothing. Same lie as a crashed semgrep reporting a clean repo:
+      // the result is unknown, not good.
+      if (!lhr || !lhr.categories) {
+        return {
+          runnerId: this.id,
+          domain: this.domain,
+          status: "error",
+          findings: [],
+          note: "Lighthouse returned no report — the scan produced no data, so the scores are unknown, not passing.",
+          durationMs: Date.now() - start,
+        };
+      }
+
       const scores: Record<string, number> = {};
-      if (lhr) {
+      {
         for (const [key, cat] of Object.entries(lhr.categories)) {
           const score = cat.score ?? 0;
           scores[key] = score;
