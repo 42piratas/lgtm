@@ -38,3 +38,19 @@ regexes = [
   # Subresource-integrity: sha256-/sha384-/sha512- followed by base64.
   '''^sha(256|384|512)-[A-Za-z0-9+/]{20,}={0,2}$''',
 ]
+# Fixture paths: secret-shaped values in these files are test stubs, example
+# placeholders, or this allowlist's own fingerprints — never live credentials.
+# This suppresses ALL rules for these paths, so a real prefixed credential
+# (AKIA..., sk_live_...) committed *inside* a test file or .env.example is also
+# masked here — the backstop is code review of those files. Chosen over a gate
+# that flags every test stub as a critical leak.
+paths = [
+  # *.test.ts / *.test.tsx anywhere
+  '''(^|/)[^/]*\.test\.tsx?$''',
+  # any file under a test/ directory
+  '''(^|/)test/''',
+  # example env templates (placeholders, never real secrets)
+  '''(^|/)\.env\.example$''',
+  # gitleaks' own ignore file
+  '''(^|/)\.gitleaksignore$''',
+]
