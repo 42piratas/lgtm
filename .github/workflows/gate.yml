@@ -93,6 +93,13 @@ jobs:
         env:
           ONLY: ${{ inputs.only }}
           FAIL_ON: ${{ inputs.fail-on }}
+          # Scope the secrets scan to THIS PR's commits (base..head), not the
+          # whole history — O(PR size), and it never fails a PR on a pre-existing
+          # secret it didn't introduce. Full-history coverage is the scheduled
+          # sweep's job (see sweep.yml). SHAs reach the tool through env, never
+          # spliced into the script (script-injection safe).
+          LGTM_SECRETS_LOG_OPTS: >-
+            ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
         run: npx tsx src/cli.ts run _gate --only "$ONLY" --fail-on "$FAIL_ON"
 
       # The evidence report — always uploaded, so a red gate is inspectable.
