@@ -13,6 +13,16 @@ import { dockerRun } from "../util/docker.js";
 const IMAGE = "semgrep/semgrep:latest";
 const CONFIGS = ["p/security-audit", "p/secrets", "p/owasp-top-ten", "p/javascript", "p/typescript"];
 
+// Scan scope. A PR gate answers "does THIS change add a finding" — so when the
+// caller sets LGTM_SAST_BASELINE_REF (the gate sets it to the PR's base SHA),
+// semgrep runs diff-aware (`--baseline-commit`): it scans HEAD and the baseline
+// and reports only findings NEW since that ref, so pre-existing findings in
+// untouched files never fail a PR. Unset (e.g. the scheduled sweep) → full-tree
+// scan, which owns the backlog. Diff mode needs git inside the container to
+// reach the baseline, so the checkout is mounted read-write and git safe.directory
+// is pre-set to dodge the "dubious ownership" refusal on the foreign-uid mount.
+const BASELINE_REF = process.env.LGTM_SAST_BASELINE_REF?.trim() || "";
+
 const SEVERITY_MAP: Record<string, Finding["severity"]> = {
   ERROR: "high",
   WARNING: "medium",
@@ -83,9 +93,26 @@ export const sastRunner: Runner = {
         "3",
         "--max-memory",
         "4000",
+        // Diff-aware when the caller passes a baseline: only findings introduced
+        // since that ref are reported (the gate sets it to the PR base SHA).
+        ...(BASELINE_REF ? ["--baseline-commit", BASELINE_REF] : []),
         "/src",
       ],
-      mounts: { "/src": repo },
+      // Full scan is read-only; diff mode needs git to reach the baseline commit,
+      // so mount RW and pre-declare /src a safe.directory (foreign-uid mount).
+      ...(BASELINE_REF
+        ? {
+            mountsRW: { "/src": repo },
+            extra: [
+              "-e",
+              "GIT_CONFIG_COUNT=1",
+              "-e",
+              "GIT_CONFIG_KEY_0=safe.directory",
+              "-e",
+              "GIT_CONFIG_VALUE_0=/src",
+            ],
+          }
+        : { mounts: { "/src": repo } }),
       timeoutMs: 900_000,
     });
 

@@ -100,6 +100,11 @@ jobs:
           # spliced into the script (script-injection safe).
           LGTM_SECRETS_LOG_OPTS: >-
             ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+          # Diff-scope the static analysis the same way: semgrep --baseline-commit
+          # reports only findings introduced since the PR base, so a pre-existing
+          # repo-wide finding in an untouched file never fails a PR. Full-tree
+          # coverage is the scheduled sweep's job.
+          LGTM_SAST_BASELINE_REF: ${{ github.event.pull_request.base.sha }}
         run: npx tsx src/cli.ts run _gate --only "$ONLY" --fail-on "$FAIL_ON"
 
       # The evidence report — always uploaded, so a red gate is inspectable.
