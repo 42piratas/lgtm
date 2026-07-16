@@ -105,22 +105,25 @@ The session is written to `.auth/<site>.json` (git-ignored, never committed). Th
 `authz` runner then verifies protected routes actually enforce auth (anonymous
 access → high finding), authed responses aren't cacheable, and cookies are sound.
 
-## Secret scanning — two tiers
+## Security scanning — two tiers
 
-Secret scanning is split so the blocking gate stays fast on any repo while full
-history is still covered:
+Both `secrets` and `sast` are split so the blocking gate stays fast and only ever
+fails a PR on what the PR introduces, while the whole repo is still covered:
 
-- **Per-PR gate (`gate.yml`, blocking)** scans **only the PR's commits**
-  (`base..head`). O(PR size), seconds on any repo, and it never fails a PR on a
-  pre-existing secret it did not introduce. The scope is set by the caller via
-  `LGTM_SECRETS_LOG_OPTS`; the reusable `gate.yml` does this automatically.
-- **Scheduled sweep (`sweep.yml`, non-blocking)** walks the **full history** on a
-  cron — the only place that catches a secret committed-then-deleted in old
-  history. Wire it per repo (see `sweep.yml` header). A finding fails the
-  scheduled run (red in Actions), it never blocks a PR.
+- **Per-PR gate (`gate.yml`, blocking)** is **diff-scoped**: `secrets` scans only
+  the PR's commits (`base..head`); `sast` runs semgrep diff-aware
+  (`--baseline-commit <base>`) so only findings **new since the PR base** count.
+  A pre-existing finding in an untouched file never fails a PR. The gate sets the
+  scope automatically via `LGTM_SECRETS_LOG_OPTS` / `LGTM_SAST_BASELINE_REF`.
+- **Scheduled sweep (`sweep.yml`, non-blocking)** runs both full-scope on a cron:
+  `secrets` walks the **full history** (catches a secret committed-then-deleted in
+  old history), `sast` scans the **whole tree** (the pre-existing backlog). Wire
+  it per repo (see `sweep.yml` header); a finding reds the scheduled run, never a
+  PR.
 
 A found secret is remediated by **rotating the credential and purging it from
-history** (git filter-repo / BFG) — not by narrowing the scan.
+history** (git filter-repo / BFG) — not by narrowing the scan. A pre-existing
+sast finding is fixed at source (or documented inline with `# nosemgrep`).
 
 ### Tuning
 
@@ -133,6 +136,7 @@ budget), so it fails fast and clear.
 |---|---|---|---|
 | `LGTM_SECRETS_LOG_OPTS` | `secrets` | unset = full history | commit range to scan (the gate sets `base..head`) |
 | `LGTM_SECRETS_TIMEOUT_MS` | `secrets` | `900000` (15 min) | raise for a slow full-history sweep |
+| `LGTM_SAST_BASELINE_REF` | `sast` | unset = full tree | baseline commit for diff-aware semgrep (the gate sets the PR base SHA) |
 
 `sast` (semgrep) is separately bounded for memory/parallelism on large repos (see
 `src/runners/sast.ts`).

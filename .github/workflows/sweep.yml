@@ -1,4 +1,4 @@
-# Reusable LGTM secrets SWEEP — the full-history safety net.
+# Reusable LGTM security SWEEP (secrets + sast) — the full-scan safety net.
 #
 # The per-PR gate (gate.yml) scans only each PR's own commits, so it is fast and
 # never blocks a PR on a secret it did not introduce. This sweep is the other
@@ -20,7 +20,7 @@
 #     sweep:
 #       uses: 4242labs/lgtm/.github/workflows/sweep.yml@main
 
-name: LGTM secrets sweep
+name: LGTM security sweep
 
 on:
   workflow_call:
@@ -43,7 +43,7 @@ permissions:
 
 jobs:
   sweep:
-    name: lgtm secrets sweep (full history)
+    name: lgtm security sweep (full history + full-tree sast)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout target repo
@@ -85,15 +85,17 @@ jobs:
         working-directory: lgtm
         env:
           FAIL_ON: ${{ inputs.fail-on }}
-          # No LGTM_SECRETS_LOG_OPTS → gitleaks walks the full history.
+          # No LGTM_SECRETS_LOG_OPTS / LGTM_SAST_BASELINE_REF → gitleaks walks the
+          # full history and semgrep scans the whole tree: the backlog both
+          # diff-scoped PR gates deliberately don't fail a PR on.
           LGTM_SECRETS_TIMEOUT_MS: ${{ inputs.timeout-ms }}
-        run: npx tsx src/cli.ts run _sweep --only secrets --fail-on "$FAIL_ON"
+        run: npx tsx src/cli.ts run _sweep --only secrets,sast --fail-on "$FAIL_ON"
 
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: lgtm-secrets-sweep
+          name: lgtm-security-sweep
           path: |
             lgtm/reports/**/*.html
             lgtm/reports/**/*.json
