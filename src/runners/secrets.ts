@@ -24,6 +24,16 @@ const BASELINE_CONFIG = fileURLToPath(
   new URL("./gitleaks-baseline.toml", import.meta.url),
 );
 
+// gitleaks scans the FULL git history. On large repos (thousands of commits,
+// 100 MB+ packs) the old 5-min cap killed the container before it wrote a
+// report, which fail-closes the gate with an opaque "wrote no report (exit -1)"
+// on EVERY run — a false fail, not a detected secret. Mirror the sast runner's
+// large-repo hardening (PR #17: 15-min semgrep cap): default to 15 min, and let
+// pathological histories raise it via LGTM_SECRETS_TIMEOUT_MS without a rebuild.
+const DEFAULT_TIMEOUT_MS = 900_000;
+const TIMEOUT_MS =
+  Number(process.env.LGTM_SECRETS_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
+
 interface Leak {
   Description?: string;
   File?: string;
@@ -113,7 +123,7 @@ export const secretsRunner: Runner = {
         ],
         mounts: { "/repo": repo, "/config/gitleaks.toml": BASELINE_CONFIG },
         mountsRW: { "/out": work },
-        timeoutMs: 300_000,
+        timeoutMs: TIMEOUT_MS,
       });
 
       const { commits, bytes } = scanLog(r.stderr);
@@ -121,6 +131,14 @@ export const secretsRunner: Runner = {
       // No report file at all means gitleaks never got as far as writing one:
       // a bad flag, a crash, a killed container. That is unknown, not clean.
       if (!existsSync(reportPath)) {
+        // Distinguish the large-repo timeout (the common false-fail) from a real
+        // crash so the fix is actionable, not an opaque "exit -1".
+        if (r.timedOut) {
+          return {
+            kind: "failed",
+            note: `gitleaks timed out after ${Math.round(TIMEOUT_MS / 1000)}s scanning full history (${commits} commits, ${bytes} bytes read before the kill) — raise LGTM_SECRETS_TIMEOUT_MS for very large repos.`,
+          };
+        }
         return {
           kind: "failed",
           note: `gitleaks wrote no report (exit ${r.code}): ${(r.stderr || r.stdout).slice(0, 300)}`,

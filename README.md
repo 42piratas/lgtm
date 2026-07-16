@@ -105,6 +105,20 @@ The session is written to `.auth/<site>.json` (git-ignored, never committed). Th
 `authz` runner then verifies protected routes actually enforce auth (anonymous
 access → high finding), authed responses aren't cacheable, and cookies are sound.
 
+## Tuning for large repos
+
+Some runners scan the whole repository and can hit their container time budget on
+very large targets (thousands of commits, 100 MB+ history). They **fail closed**
+(a killed scan is "unknown", never "clean"), so a too-short budget shows up as a
+gate failure, not a silent pass. Raise the budget without a rebuild:
+
+| Env var | Runner | Default | Raise it when |
+|---|---|---|---|
+| `LGTM_SECRETS_TIMEOUT_MS` | `secrets` (gitleaks, full-history scan) | `900000` (15 min) | the gate reports `gitleaks timed out after …s scanning full history` |
+
+`sast` (semgrep) is separately bounded for memory/parallelism on large repos (see
+`src/runners/sast.ts`).
+
 ## Safety
 
 - Active/mutating scans (`zap-full-scan`) run **only** against localhost and
