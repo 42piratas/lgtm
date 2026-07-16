@@ -8,12 +8,20 @@ import type {
   RunnerContext,
   RunnerOutcome,
 } from "../types.js";
-import { dockerRun } from "../util/docker.js";
+import { dockerRun, transientInfraFailure } from "../util/docker.js";
 
 // Leaked-credential scan via gitleaks (container), over the repo's git history
 // and working tree. White-box: needs the repo checkout.
 
 const IMAGE = "ghcr.io/gitleaks/gitleaks:latest";
+
+// Scan scope. A PR gate answers one question — "does THIS change add a secret" —
+// so it scans only the PR's commit range (base..head), set by the caller via
+// LGTM_SECRETS_LOG_OPTS. That is O(PR size), not O(full history): seconds on any
+// repo, and it does not fail a PR on a pre-existing secret it never touched.
+// Unset (e.g. the scheduled full-history sweep) → gitleaks walks all history, the
+// only place that catches a secret committed-then-deleted in old history.
+const LOG_OPTS = process.env.LGTM_SECRETS_LOG_OPTS?.trim() || "";
 
 // Baseline config shipped beside this file. `useDefault = true` keeps the full
 // upstream ruleset and only adds an allowlist for hash-shaped literals (content
@@ -120,10 +128,19 @@ export const secretsRunner: Runner = {
           "--no-banner",
           "--exit-code",
           "0", // findings are not a failure — we read the report ourselves
+          // Scope to the PR's commits when the caller sets a range; otherwise
+          // full history (the scheduled sweep). One flag reused, never spliced.
+          ...(LOG_OPTS ? ["--log-opts", LOG_OPTS] : []),
         ],
         mounts: { "/repo": repo, "/config/gitleaks.toml": BASELINE_CONFIG },
         mountsRW: { "/out": work },
         timeoutMs: TIMEOUT_MS,
+        // A wall-clock timeout on this CPU-bound scan is deterministic, not a
+        // transient blip — re-running the same too-big scan just burns another
+        // full budget (the 3x-timeout amplification we saw on hiresling-meta:
+        // 3 x 900s = 45min). Retry only genuine transients (OOM/network), never
+        // the timeout itself.
+        retryOn: (res) => !res.timedOut && transientInfraFailure(res),
       });
 
       const { commits, bytes } = scanLog(r.stderr);

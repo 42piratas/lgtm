@@ -1,0 +1,100 @@
+# Reusable LGTM secrets SWEEP — the full-history safety net.
+#
+# The per-PR gate (gate.yml) scans only each PR's own commits, so it is fast and
+# never blocks a PR on a secret it did not introduce. This sweep is the other
+# half of that design: it walks the ENTIRE git history on a schedule, catching
+# secrets that predate the gate or were committed-then-deleted in old history —
+# the one thing a diff-scoped gate cannot see. It is non-blocking to PRs; a
+# finding fails the scheduled run so it shows up red in the Actions tab and can
+# be alerted on.
+#
+# Caller (in the target repo, .github/workflows/secrets-sweep.yml):
+#
+#   name: Secrets sweep
+#   on:
+#     schedule: [{ cron: "0 6 * * 1" }]   # Mondays 06:00 UTC
+#     workflow_dispatch:
+#   permissions:
+#     contents: read
+#   jobs:
+#     sweep:
+#       uses: 4242labs/lgtm/.github/workflows/sweep.yml@main
+
+name: LGTM secrets sweep
+
+on:
+  workflow_call:
+    inputs:
+      lgtm-ref:
+        description: Git ref of 4242labs/lgtm to run the sweep from.
+        type: string
+        default: main
+      fail-on:
+        description: Fail the run at or above this severity (critical|high|medium|low).
+        type: string
+        default: high
+      timeout-ms:
+        description: Per-scan container budget. Full history is slow; this is non-blocking, so it is generous.
+        type: string
+        default: "3600000"
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    name: lgtm secrets sweep (full history)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: target
+          fetch-depth: 0 # full history — the whole point of the sweep
+
+      - name: Checkout LGTM
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: 4242labs/lgtm
+          ref: ${{ inputs.lgtm-ref }}
+          path: lgtm
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: lgtm/package-lock.json
+
+      - name: Install LGTM
+        working-directory: lgtm
+        run: npm ci
+
+      - name: Write sweep config
+        env:
+          REPO: ${{ github.repository }}
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          cat > lgtm/sites/_sweep.yaml <<EOF
+          name: _sweep
+          label: "$REPO"
+          baseUrl: http://localhost
+          repoPath: "$WORKSPACE/target"
+          EOF
+
+      - name: Run sweep
+        working-directory: lgtm
+        env:
+          FAIL_ON: ${{ inputs.fail-on }}
+          # No LGTM_SECRETS_LOG_OPTS → gitleaks walks the full history.
+          LGTM_SECRETS_TIMEOUT_MS: ${{ inputs.timeout-ms }}
+        run: npx tsx src/cli.ts run _sweep --only secrets --fail-on "$FAIL_ON"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lgtm-secrets-sweep
+          path: |
+            lgtm/reports/**/*.html
+            lgtm/reports/**/*.json
+          if-no-files-found: warn

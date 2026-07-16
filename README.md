@@ -105,16 +105,34 @@ The session is written to `.auth/<site>.json` (git-ignored, never committed). Th
 `authz` runner then verifies protected routes actually enforce auth (anonymous
 access → high finding), authed responses aren't cacheable, and cookies are sound.
 
-## Tuning for large repos
+## Secret scanning — two tiers
 
-Some runners scan the whole repository and can hit their container time budget on
-very large targets (thousands of commits, 100 MB+ history). They **fail closed**
-(a killed scan is "unknown", never "clean"), so a too-short budget shows up as a
-gate failure, not a silent pass. Raise the budget without a rebuild:
+Secret scanning is split so the blocking gate stays fast on any repo while full
+history is still covered:
 
-| Env var | Runner | Default | Raise it when |
+- **Per-PR gate (`gate.yml`, blocking)** scans **only the PR's commits**
+  (`base..head`). O(PR size), seconds on any repo, and it never fails a PR on a
+  pre-existing secret it did not introduce. The scope is set by the caller via
+  `LGTM_SECRETS_LOG_OPTS`; the reusable `gate.yml` does this automatically.
+- **Scheduled sweep (`sweep.yml`, non-blocking)** walks the **full history** on a
+  cron — the only place that catches a secret committed-then-deleted in old
+  history. Wire it per repo (see `sweep.yml` header). A finding fails the
+  scheduled run (red in Actions), it never blocks a PR.
+
+A found secret is remediated by **rotating the credential and purging it from
+history** (git filter-repo / BFG) — not by narrowing the scan.
+
+### Tuning
+
+Scanners **fail closed** (a killed scan is "unknown", never "clean"), so a
+too-short budget is a visible failure, not a silent pass. A wall-clock timeout is
+**not** retried (a too-big scan is deterministic; retrying just burns another full
+budget), so it fails fast and clear.
+
+| Env var | Where | Default | Use |
 |---|---|---|---|
-| `LGTM_SECRETS_TIMEOUT_MS` | `secrets` (gitleaks, full-history scan) | `900000` (15 min) | the gate reports `gitleaks timed out after …s scanning full history` |
+| `LGTM_SECRETS_LOG_OPTS` | `secrets` | unset = full history | commit range to scan (the gate sets `base..head`) |
+| `LGTM_SECRETS_TIMEOUT_MS` | `secrets` | `900000` (15 min) | raise for a slow full-history sweep |
 
 `sast` (semgrep) is separately bounded for memory/parallelism on large repos (see
 `src/runners/sast.ts`).
