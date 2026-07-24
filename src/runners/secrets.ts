@@ -80,7 +80,14 @@ export const secretsRunner: Runner = {
 
   sufficient(cov: Coverage): string | null {
     if (Number(cov.data.commits ?? 0) === 0) {
-      return "gitleaks scanned 0 commits — the path is not a git repository, or has no history";
+      // Diff-scoped PR mode (a base..head range was set): an empty range — 0
+      // commits — means the PR introduced no new commits to scan, so there is
+      // nothing it could have leaked. That is a clean pass, not missing
+      // evidence. Only an UNSCOPED full-history scan (the sweep) that sees 0
+      // commits signals a non-repo path or an empty history.
+      return cov.data.scoped
+        ? null
+        : "gitleaks scanned 0 commits — the path is not a git repository, or has no history";
     }
     if (Number(cov.data.bytes ?? 0) === 0) {
       return "gitleaks read 0 bytes — nothing was actually examined";
@@ -215,10 +222,12 @@ function collect(
       findings,
       coverage: {
         trail: [
-          `scanned ${commits} commit${commits === 1 ? "" : "s"} of history`,
+          LOG_OPTS
+            ? `scanned ${commits} commit${commits === 1 ? "" : "s"} in the PR range (${LOG_OPTS})`
+            : `scanned ${commits} commit${commits === 1 ? "" : "s"} of history`,
           `read ${bytes} bytes of content`,
         ],
-        data: { commits, bytes },
+        data: { commits, bytes, scoped: Boolean(LOG_OPTS) },
         provenance: "gitleaks scan log (stderr)",
       },
       meta: { leakCount: findings.length, commits, bytes },
