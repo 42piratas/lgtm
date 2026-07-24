@@ -22,7 +22,7 @@
     "axe-core": "^4.10.2",
     "chrome-launcher": "^1.1.2",
     "commander": "^12.1.0",
-    "lighthouse": "^13.4.0",
+    "lighthouse": "^13.4.1",
     "picocolors": "^1.1.1",
     "playwright": "^1.48.2",
     "tldts": "^7.4.8",
