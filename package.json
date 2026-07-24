@@ -2,7 +2,7 @@
   "name": "lgtm",
   "version": "0.1.0",
   "private": true,
-  "description": "lgtm \u2014 cross-site security, accessibility, privacy and quality harness. Runs locally before launch, re-pointable at any live URL.",
+  "description": "lgtm — cross-site security, accessibility, privacy and quality harness. Runs locally before launch, re-pointable at any live URL.",
   "type": "module",
   "bin": {
     "lgtm": "./src/cli.ts"
@@ -22,17 +22,17 @@
     "axe-core": "^4.10.2",
     "chrome-launcher": "^1.1.2",
     "commander": "^12.1.0",
-    "lighthouse": "^12.2.1",
+    "lighthouse": "^13.4.0",
     "picocolors": "^1.1.1",
     "playwright": "^1.48.2",
     "tldts": "^7.4.8",
     "yaml": "^2.6.1",
-    "zod": "^3.23.8"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/node": "^22.9.0",
+    "@types/node": "^26.1.1",
     "tsx": "^4.19.2",
-    "typescript": "^5.6.3",
-    "vitest": "^3.2.7"
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
   }
 }
